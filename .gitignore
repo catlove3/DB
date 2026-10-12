@@ -1,0 +1,31 @@
+# CMake build trees and compiler output
+/build*/
+/out/
+*.o
+*.obj
+*.pdb
+
+# Visual Studio local state; keep the original solution/project files
+.vs/
+*.vcxproj.user
+*.suo
+/数据库大作业/Debug/
+/数据库大作业/Release/
+/数据库大作业/x64/
+/数据库大作业/数据库大作业/Debug/
+/数据库大作业/数据库大作业/Release/
+/数据库大作业/数据库大作业/x64/
+
+# Runtime data and disposable test data
+/data/
+/test-data*/
+
+# Generate the parser locally once ANTLR is introduced
+/generated/*
+!/generated/README.md
+/tools/antlr*.jar
+
+# Local presets and Python caches
+CMakeUserPresets.json
+__pycache__/
+*.pyc

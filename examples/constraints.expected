@@ -1,0 +1,23 @@
+!ERROR
+duplicate key
+@
+id,gpa
+1,3.90
+@
+!ERROR
+foreign constraint failed
+@
+!ERROR
+foreign constraint failed
+@
+!ERROR
+foreign constraint failed
+@
+!ERROR
+primary definition invalid
+@
+id,name
+1,Alice
+@
+id,name
+@

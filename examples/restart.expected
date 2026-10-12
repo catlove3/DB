@@ -1,0 +1,15 @@
+id,name,gpa
+1,Alice,3.90
+@
+student_id,course_id,grade
+1,101,95.00
+@
+id
+1
+@
+!ERROR
+duplicate key
+@
+!ERROR
+foreign constraint failed
+@

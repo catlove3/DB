@@ -1,0 +1,10 @@
+CREATE DATABASE mvp_demo;
+USE mvp_demo;
+CREATE TABLE student (id INT, name VARCHAR(32), gpa FLOAT);
+INSERT INTO student VALUES (1,'Alice',3.80),(2,'Bob',3.50);
+SELECT id,name FROM student WHERE id=1;
+UPDATE student SET gpa=3.80 WHERE id=1;
+UPDATE student SET gpa=3.90 WHERE id=1;
+SELECT id,gpa FROM student WHERE id=1;
+DELETE FROM student WHERE id=2;
+SELECT name FROM student WHERE id=2;

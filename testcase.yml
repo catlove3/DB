@@ -1,0 +1,15 @@
+# Course runner configuration, evaluated from the repository root.
+# This starter only builds the CLI; database test groups will fail until the
+# corresponding modules are implemented. These flags list the basic scope.
+compile:
+  commands: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF && cmake --build build -j1
+run:
+  commands: ./build/mydb
+  flags:
+    - query
+    - data
+    - index
+    - join
+    - pk
+    - fk
+    - comb
