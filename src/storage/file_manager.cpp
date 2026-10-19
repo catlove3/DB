@@ -6,7 +6,6 @@
 #include <stdexcept>     // runtime_error
 #include <filesystem>
 #include <limits>
-#include <memory>
 #include <sys/stat.h>
 
 namespace db
@@ -187,7 +186,7 @@ bool file_handle::is_open()const
 }
 
 
-off_t file_handle::calc_offset(page_id idx,bool append_back)
+off_t file_handle::calc_offset(page_id idx,bool append_back)const
 {
     if(!is_open())
         throw std::runtime_error("this handle hasn't been assigned to any file yet.");
@@ -203,7 +202,7 @@ off_t file_handle::calc_offset(page_id idx,bool append_back)
 }
 
 
-void file_handle::read_page(page_id idx,page& dest)
+void file_handle::read_page(page_id idx,page& dest)const
 {
     off_t offset = calc_offset(idx);
     safe_read(os_id,dest.data(),page_size,offset);
@@ -261,7 +260,7 @@ file_id file_handle::get_id()const noexcept{
 file_manager::file_manager():next(0){}
 
 
-void file_manager::create_file(const std::string & path)
+void file_manager::create_file(const std::string & path)const
 {
     std::string normalized_path = normalize_path(path);
     int os_id = ::open(normalized_path.c_str(),O_CREAT | O_EXCL | O_RDWR,FILE_MODE);
@@ -283,7 +282,7 @@ void file_manager::create_file(const std::string & path)
 }
 
 
-file_handle* file_manager::open_file(const std::string & maybe_un_normalized_path)
+file_id file_manager::open_file(const std::string & maybe_un_normalized_path)
 {
     std::string path = normalize_path(maybe_un_normalized_path);
     if(filenames.find(path) != filenames.end())
@@ -313,11 +312,11 @@ file_handle* file_manager::open_file(const std::string & maybe_un_normalized_pat
         throw std::runtime_error("file is smaller than the number of pages in its header.");
 
     file_id id = next;
-    std::unique_ptr<file_handle> fh(new file_handle(header.num_pages,id,guard.get()));
+    file_handle* fh = new file_handle(header.num_pages,id,guard.get());
     guard.release();
 
     try{
-        file_handles.emplace(id,fh.get());
+        file_handles.emplace(id,fh);
         filenames.emplace(path,id);
         idx2name.emplace(id,path);
     }
@@ -325,11 +324,12 @@ file_handle* file_manager::open_file(const std::string & maybe_un_normalized_pat
         file_handles.erase(id);
         filenames.erase(path);
         idx2name.erase(id);
+        delete fh;
         throw;
     }
 
     next = id + 1;
-    return fh.release();
+    return id;
 }
 
 
@@ -372,7 +372,14 @@ void file_manager::remove_file(const std::string & path)
 }
 
 
-
+file_handle & file_manager::get_file(file_id id)
+{
+    auto it = file_handles.find(id);
+    if(it == file_handles.end())
+        throw std::runtime_error("this file does not exists.");
+    
+    return *it->second;
+} 
 
 
 

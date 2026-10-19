@@ -111,9 +111,9 @@ void test_create_open_close_remove(temp_dir& tmp)
     CHECK(fs::exists(path));
     CHECK(throws([&] { fm.create_file(path.string()); }));
 
-    file_handle* handle = fm.open_file(path.string());
-    const file_id id = handle->get_id();
-    CHECK(handle->is_open());
+    const file_id id = fm.open_file(path.string());
+    file_handle& handle = fm.get_file(id);
+    CHECK(handle.is_open());
     CHECK(throws([&] { fm.open_file(path.string()); }));
     CHECK(throws([&] { fm.remove_file(path.string()); }));
 
@@ -121,32 +121,34 @@ void test_create_open_close_remove(temp_dir& tmp)
     for(std::size_t i = 0; i < data.size(); ++i)
         data[i] = (std::byte)(i & 0xff);
 
-    CHECK(handle->allocate_page() == 1);
-    handle->write_page(1, data);
+    CHECK(handle.allocate_page() == 1);
+    handle.write_page(1, data);
 
     page out{};
-    handle->read_page(1, out);
+    handle.read_page(1, out);
     CHECK(out == data);
-    CHECK(throws([&] { handle->read_page(2, out); }));
-    CHECK(throws([&] { handle->write_page(2, data); }));
+    CHECK(throws([&] { handle.read_page(2, out); }));
+    CHECK(throws([&] { handle.write_page(2, data); }));
 
     page appended{};
     appended.fill(std::byte{0x5a});
-    handle->append_page(appended);
+    handle.append_page(appended);
 
     fm.close_file(id);
     CHECK(throws([&] { fm.close_file(id); }));
+    CHECK(throws([&] { fm.get_file(id); }));
 
-    file_handle* reopened = fm.open_file(path.string());
-    CHECK(reopened->get_id() != id);
-    CHECK(reopened->allocate_page() == 3);
+    const file_id reopened_id = fm.open_file(path.string());
+    CHECK(reopened_id != id);
+    file_handle& reopened = fm.get_file(reopened_id);
+    CHECK(reopened.allocate_page() == 3);
 
-    reopened->read_page(1, out);
+    reopened.read_page(1, out);
     CHECK(out == data);
-    reopened->read_page(2, out);
+    reopened.read_page(2, out);
     CHECK(out == appended);
 
-    fm.close_file(reopened->get_id());
+    fm.close_file(reopened_id);
 
     fm.remove_file(path.string());
     CHECK(!fs::exists(path));
@@ -161,8 +163,7 @@ void test_path_aliases(temp_dir& tmp)
     const fs::path dot_alias = tmp.path / "." / "alias.db";
 
     fm.create_file(path.string());
-    file_handle* handle = fm.open_file(path.string());
-    const file_id id = handle->get_id();
+    const file_id id = fm.open_file(path.string());
 
     CHECK(normalize_path(path.string()) == normalize_path(dot_alias.string()));
     CHECK(throws([&] { fm.open_file(dot_alias.string()); }));
@@ -189,34 +190,38 @@ void test_multiple_files(temp_dir& tmp)
     fm.create_file(path_a.string());
     fm.create_file(path_b.string());
 
-    file_handle* handle_a = fm.open_file(path_a.string());
-    file_handle* handle_b = fm.open_file(path_b.string());
-    CHECK(handle_a->get_id() != handle_b->get_id());
+    const file_id id_a = fm.open_file(path_a.string());
+    const file_id id_b = fm.open_file(path_b.string());
+    CHECK(id_a != id_b);
 
-    CHECK(handle_a->allocate_page() == 1);
-    CHECK(handle_b->allocate_page() == 1);
+    file_handle& handle_a = fm.get_file(id_a);
+    file_handle& handle_b = fm.get_file(id_b);
+    CHECK(handle_a.allocate_page() == 1);
+    CHECK(handle_b.allocate_page() == 1);
 
     page data_a{};
     data_a.fill(std::byte{0x11});
     page data_b{};
     data_b.fill(std::byte{0x22});
-    handle_a->write_page(1, data_a);
-    handle_b->write_page(1, data_b);
+    handle_a.write_page(1, data_a);
+    handle_b.write_page(1, data_b);
 
-    fm.close_file(handle_a->get_id());
-    fm.close_file(handle_b->get_id());
+    fm.close_file(id_a);
+    fm.close_file(id_b);
 
-    file_handle* reopened_a = fm.open_file(path_a.string());
-    file_handle* reopened_b = fm.open_file(path_b.string());
+    const file_id reopened_a_id = fm.open_file(path_a.string());
+    const file_id reopened_b_id = fm.open_file(path_b.string());
+    file_handle& reopened_a = fm.get_file(reopened_a_id);
+    file_handle& reopened_b = fm.get_file(reopened_b_id);
 
     page out{};
-    reopened_a->read_page(1, out);
+    reopened_a.read_page(1, out);
     CHECK(out == data_a);
-    reopened_b->read_page(1, out);
+    reopened_b.read_page(1, out);
     CHECK(out == data_b);
 
-    fm.close_file(reopened_a->get_id());
-    fm.close_file(reopened_b->get_id());
+    fm.close_file(reopened_a_id);
+    fm.close_file(reopened_b_id);
 }
 
 void test_invalid_headers(temp_dir& tmp)
@@ -268,10 +273,11 @@ void test_truncated_file(temp_dir& tmp)
     const fs::path path = tmp.path / "truncated.db";
 
     fm.create_file(path.string());
-    file_handle* handle = fm.open_file(path.string());
-    CHECK(handle->allocate_page() == 1);
-    CHECK(handle->allocate_page() == 2);
-    fm.close_file(handle->get_id());
+    const file_id id = fm.open_file(path.string());
+    file_handle& handle = fm.get_file(id);
+    CHECK(handle.allocate_page() == 1);
+    CHECK(handle.allocate_page() == 2);
+    fm.close_file(id);
 
     fs::resize_file(path, page_size);
     CHECK(throws([&] { fm.open_file(path.string()); }));

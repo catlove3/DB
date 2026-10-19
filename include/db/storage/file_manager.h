@@ -51,7 +51,7 @@ namespace db{
         file_id id;
         int os_id;
         bool dirty;
-        off_t calc_offset(page_id idx,bool append_back = false);
+        off_t calc_offset(page_id idx,bool append_back = false)const;
         file_handle(const file_handle & fh) = delete;
         file_handle & operator=(const file_handle & fh) =delete;
     public:
@@ -59,7 +59,7 @@ namespace db{
         file_handle(page_id npg,file_id fid,int oid);
         ~file_handle();
         bool is_open()const;
-        void read_page(page_id idx,page& dest);
+        void read_page(page_id idx,page& dest)const;
         void write_page(page_id idx,const page & src);
         page_id allocate_page();
         void close();
@@ -80,9 +80,10 @@ namespace db{
     public:
         file_manager();
         ~file_manager();
-        void create_file(const std::string & path);
-        file_handle* open_file(const std::string & path);
+        void create_file(const std::string & path)const;
+        file_id open_file(const std::string & path);
         void close_file(file_id id);
         void remove_file(const std::string & path);
+        file_handle & get_file(file_id id);
     };
 }
