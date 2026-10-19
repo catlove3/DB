@@ -245,8 +245,6 @@ void file_handle::close()
 }
 
 
-~file_handle()
-
 void file_handle::append_page(const page & src)
 {
     off_t offset = calc_offset(num_pages,true);
