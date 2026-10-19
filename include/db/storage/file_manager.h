@@ -65,6 +65,7 @@ namespace db{
         void close();
         void append_page(const page & src);
         file_id get_id()const noexcept;
+        page_id get_num_pages()const noexcept{return num_pages;}
     };
 
 
