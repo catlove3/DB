@@ -6,6 +6,7 @@
 namespace db {
 	typedef std::uint64_t file_id;
 	typedef std::uint64_t page_id;
-	const std::uint64_t page_size = 8192;
+	constexpr const std::uint64_t page_size = 8192;
 	typedef std::array<std::byte, page_size> page;
+	typedef std::uint32_t frame_id;
 }

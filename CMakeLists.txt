@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
 project(IDBS VERSION 0.1.0 LANGUAGES CXX)
 
+option(IDBS_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(IDBS_ENABLE_SANITIZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    message(FATAL_ERROR "IDBS_ENABLE_SANITIZERS requires GCC or Clang")
+endif()
+
 # Set these per target so third-party dependencies can use their own warnings.
 function(idbs_configure_target target)
     target_compile_features(${target} PUBLIC cxx_std_17)
@@ -10,13 +15,21 @@ function(idbs_configure_target target)
         CXX_EXTENSIONS OFF
     )
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    if(IDBS_ENABLE_SANITIZERS)
+        target_compile_options(${target} PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
 endfunction()
 
 add_library(db_common STATIC src/common/cli.cpp)
 target_include_directories(db_common PUBLIC "${PROJECT_SOURCE_DIR}/include")
 idbs_configure_target(db_common)
 
-add_library(db_storage STATIC src/storage/file_manager.cpp)
+add_library(db_storage STATIC
+    src/storage/file_manager.cpp
+    src/storage/buffer_pool.cpp
+)
 target_include_directories(db_storage PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(db_storage PUBLIC db_common)
 idbs_configure_target(db_storage)
@@ -34,6 +47,12 @@ if(BUILD_TESTING)
     idbs_configure_target(unit_file_manager)
     add_test(NAME unit_file_manager COMMAND unit_file_manager)
     set_tests_properties(unit_file_manager PROPERTIES TIMEOUT 30)
+
+    add_executable(unit_buffer_pool tests/unit/test_buffer_pool.cpp)
+    target_link_libraries(unit_buffer_pool PRIVATE db_storage)
+    idbs_configure_target(unit_buffer_pool)
+    add_test(NAME unit_buffer_pool COMMAND unit_buffer_pool)
+    set_tests_properties(unit_buffer_pool PROPERTIES TIMEOUT 30)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
