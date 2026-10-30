@@ -9,6 +9,11 @@ namespace db
 
 namespace {
 
+/**
+ * 构造缓存层 db_error 值，复制 message/operation，按值记录可选 fid/pid。
+ * 两个字符串指针必须有效；本函数不验证对象或页、不 throw 返回的异常，交给调用方抛出。
+ * 构造分配失败向上传递；不改变缓存、统计计数或文件状态。
+ */
 db_error pool_error(error_code code, const char* message, const char* operation,
                     std::optional<file_id> fid = {}, std::optional<page_id> pid = {})
 {
@@ -19,6 +24,9 @@ db_error pool_error(error_code code, const char* message, const char* operation,
     return db_error(code, message, std::move(context));
 }
 
+// 在任何缓存操作前拒绝 pid=0，抛带 fid/pid 的 invalid_page；错误构造可分配失败。
+// 其他 pid 直接放行，不验证 fid 是否打开或 pid 是否在文件内；调用方随后负责这些检查。
+// operation 必须为有效 C 字符串；本函数不修改缓存、统计或磁盘。
 void require_data_page(file_id fid, page_id pid, const char* operation)
 {
     if (pid == 0)
@@ -26,6 +34,9 @@ void require_data_page(file_id fid, page_id pid, const char* operation)
                          "file header page cannot be cached", operation, fid, pid);
 }
 
+// 构造容器前验证帧数在 [1, invalid_frame_id]；成功原样返回，尚未分配任何帧。
+// 最大值允许作为“数量”，合法帧下标仍严格小于 invalid_frame_id 这个哨兵。
+// 越界抛 invalid_argument，错误对象分配失败透传；不修改已有对象或文件。
 std::size_t checked_frame_count(std::size_t count)
 {
     if (count == 0 || count > invalid_frame_id)
@@ -646,8 +657,8 @@ Class : BUFFER POOL MANAGER
 
 Docs:
     Single-threaded page cache. The page table and per-file page sets describe
-    the same resident frames. See docs/BUFFER_POOL.zh-CN.md for lifecycle,
-    error handling, statistics and examples.
+    the same resident frames. See include/db/storage/buffer_pool.h for
+    lifecycle, error handling and statistics contracts.
 */
 
 frame * buffer_pool_manager::get_frame(frame_id fid)noexcept
@@ -1040,6 +1051,8 @@ const buffer_pool_stats & buffer_pool_manager::stats() const noexcept
 
 void buffer_pool_manager::check_invariants() const
 {
+    // 只检查调用方给出的布尔条件：真则返回，假则抛带诊断文本的 internal_error。
+    // message 须为有效 C 字符串；不修复结构、不改变统计，错误构造可抛分配异常。
     auto require = [](bool ok, const char * message) {
         if (!ok)
             throw pool_error(error_code::internal_error, message, "buffer_pool.check_invariants");

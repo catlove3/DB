@@ -20,6 +20,8 @@ constexpr off_t num_pages_offset = sizeof(file_header::magic_number) + sizeof(fi
 
 namespace {
 
+// 按值复制操作名和路径到独立错误上下文，不检查路径是否存在；不修改输入或文件。
+// 字符串复制可能抛分配异常，尚未完成的上下文不会向调用者发布。
 error_context path_context(const std::string& operation, const std::string& path)
 {
     error_context result;
@@ -28,6 +30,12 @@ error_context path_context(const std::string& operation, const std::string& path
     return result;
 }
 
+/**
+ * 把调用方在失败现场保存的 errno 转成指定 code 的 db_error，默认 io_error。
+ * context 按值接收，覆盖其中 operation/os_error，保留路径、对象和页等其他字段。
+ * 始终抛出；错误文本/上下文分配失败可改为抛标准分配异常，不执行清理或 I/O。
+ * 因此它不撤销此前系统调用造成的状态，调用方仍负责关闭和失败边界判断。
+ */
 [[noreturn]] void throw_os_error(const std::string& operation, int saved_errno,
                                 error_context context = {},
                                 error_code code = error_code::io_error)
@@ -37,6 +45,8 @@ error_context path_context(const std::string& operation, const std::string& path
     throw db_error(code, operation + ": " + std::strerror(saved_errno), std::move(context));
 }
 
+// 将已保存 errno 映射到路径类错误：EEXIST→object_exists，
+// ENOENT/ENOTDIR→object_not_found，其余→io_error；不读当前 errno，不修改状态。
 error_code path_error_code(int saved_errno)
 {
     if (saved_errno == EEXIST)
@@ -46,6 +56,12 @@ error_code path_error_code(int saved_errno)
     return error_code::io_error;
 }
 
+/**
+ * 仅验证 I/O 参数形状：非零长度需非空 buffer，offset 非负，offset+size 可由 off_t 表示。
+ * buffer 的实际可访问字节数和读写权限仍由调用方保证；operation 必须为有效 C 字符串。
+ * 不合法时抛 invalid_argument（构造异常可能分配失败），合法时直接返回。
+ * 不解引用 buffer，不发起 I/O，不改变内存或磁盘；size=0 允许 buffer=nullptr。
+ */
 void validate_io(const void* buffer, std::size_t size, off_t offset,
                  const char* operation)
 {
@@ -390,6 +406,9 @@ void file_manager::create_file(const std::string & path)const
     fd_guard guard(os_id);
     // This manager is single-threaded and operates on its managed directory.
     // Only the path successfully created by this call is eligible for cleanup.
+    // 仅用于本次 O_EXCL 成功创建后的失败清理；借用仍存活的 guard 和 normalized_path。
+    // 先释放 guard 所有权并最多提交一次 close，再 unlink 本次路径；不重试系统 close。
+    // 返回 0 或 unlink 的 errno；close 错误不报告。无异常，但失败可留下本次新建文件。
     const auto cleanup = [&]() noexcept -> int {
         const int owned_fd = guard.release();
         if (owned_fd != -1)

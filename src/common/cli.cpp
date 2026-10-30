@@ -6,6 +6,8 @@
 namespace db {
 
 namespace {
+// 构造拥有 message 副本/移动值、operation=parse_cli 的 invalid_argument 异常；
+// 本函数只返回异常对象，由调用方 throw。构造分配失败向上传递，不修改 CLI 状态。
 db_error cli_error(std::string message) {
     error_context context;
     context.operation = "parse_cli";
@@ -17,6 +19,9 @@ CliOptions parse_cli(int argc, char* argv[]) {
     CliOptions options;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
+        // 借用当前 i/argc/argv/argument，读取紧随选项的非空且非 '-' 开头的值。
+        // 缺值抛 invalid_argument 且不递增 i；成功先递增 i，再返回拥有内容的字符串。
+        // 字符串分配失败时局部 i 可能已递增，但 parse_cli 整体退出，不发布半成品选项。
         const auto read_value = [&]() -> std::string {
             if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
                 throw cli_error("missing value for " + argument);

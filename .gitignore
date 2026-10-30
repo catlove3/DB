@@ -16,6 +16,9 @@
 /数据库大作业/数据库大作业/Release/
 /数据库大作业/数据库大作业/x64/
 
+# Local development documentation (kept on disk, not versioned)
+/docs/
+
 # Runtime data and disposable test data
 /data/
 /test-data*/
