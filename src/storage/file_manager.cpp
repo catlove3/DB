@@ -3,7 +3,7 @@
 #include <fcntl.h>       // open(), O_RDWR 等（如果这里不用open可以暂时不需要）
 #include <cerrno>        // errno
 #include <cstring>       // memset, strerror
-#include <stdexcept>     // runtime_error
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <sys/stat.h>
@@ -18,15 +18,60 @@ constexpr uint32_t ver = 1;
 constexpr file_header fh(magic,ver,page_size,1);
 constexpr off_t num_pages_offset = sizeof(file_header::magic_number) + sizeof(file_header::version) + sizeof(file_header::page_size);
 
+namespace {
+
+error_context path_context(const std::string& operation, const std::string& path)
+{
+    error_context result;
+    result.operation = operation;
+    result.path = path;
+    return result;
+}
+
+[[noreturn]] void throw_os_error(const std::string& operation, int saved_errno,
+                                error_context context = {},
+                                error_code code = error_code::io_error)
+{
+    context.operation = operation;
+    context.os_error = saved_errno;
+    throw db_error(code, operation + ": " + std::strerror(saved_errno), std::move(context));
+}
+
+error_code path_error_code(int saved_errno)
+{
+    if (saved_errno == EEXIST)
+        return error_code::object_exists;
+    if (saved_errno == ENOENT || saved_errno == ENOTDIR)
+        return error_code::object_not_found;
+    return error_code::io_error;
+}
+
+void validate_io(const void* buffer, std::size_t size, off_t offset,
+                 const char* operation)
+{
+    if ((size != 0 && buffer == nullptr) || offset < 0 ||
+        size > static_cast<std::uintmax_t>(std::numeric_limits<off_t>::max() - offset)) {
+        error_context context;
+        context.operation = operation;
+        throw db_error(error_code::invalid_argument, "invalid I/O buffer or extent",
+                       std::move(context));
+    }
+}
+
+} // namespace
+
 
 std::string normalize_path(const std::string & path)
 {
+    if (path.empty())
+        throw db_error(error_code::invalid_argument, "empty file path",
+                       path_context("normalize_path", path));
     std::error_code ec;
     std::filesystem::path absolute_path = std::filesystem::absolute(path,ec);
-    if(ec) throw std::filesystem::filesystem_error("failed to make path absolute", path, ec);
+    if(ec) throw_os_error("absolute_path", ec.value(), path_context("absolute_path", path));
 
     std::filesystem::path p = std::filesystem::weakly_canonical(absolute_path,ec);
-    if(ec) throw std::filesystem::filesystem_error("failed to normalize path", path, ec);
+    if(ec) throw_os_error("normalize_path", ec.value(), path_context("normalize_path", path));
     return p.string();
 }
 
@@ -34,34 +79,48 @@ std::string normalize_path(const std::string & path)
 
 void safe_read(int os_id,void * dest,size_t n,off_t offset)
 {
+    validate_io(dest, n, offset, "pread");
     uint8_t * dst = (uint8_t *)dest;
     size_t done = 0;
     while(done < n)
     {
-        ssize_t flag = ::pread(os_id,dst+done,n-done,offset+(off_t)done);
+        const size_t remaining = std::min(n - done, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        ssize_t flag = ::pread(os_id,dst+done,remaining,offset+(off_t)done);
         if(flag < 0)
         {
-            if(errno == EINTR)continue;
-            throw std::runtime_error(std::string("pread: ") + std::strerror(errno));
+            const int saved_errno = errno;
+            if(saved_errno == EINTR)continue;
+            throw_os_error("pread", saved_errno);
         }
-        if(flag == 0) throw std::runtime_error("unexpected EOF");
+        if(flag == 0) {
+            error_context context;
+            context.operation = "pread";
+            throw db_error(error_code::invalid_format, "unexpected EOF", std::move(context));
+        }
         done += (size_t)flag;
     }
 }
 
 void safe_write(int os_id,const void*srcc,size_t n,off_t offset)
 {
-    uint8_t * src = (uint8_t*)srcc;
+    validate_io(srcc, n, offset, "pwrite");
+    const uint8_t * src = static_cast<const uint8_t*>(srcc);
     size_t done = 0;
     while(done < n)
     {
-        ssize_t flag = ::pwrite(os_id,src + done,n-done,offset+(off_t)done);
+        const size_t remaining = std::min(n - done, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        ssize_t flag = ::pwrite(os_id,src + done,remaining,offset+(off_t)done);
         if(flag < 0)
         {
-            if(errno == EINTR)continue;
-            throw std::runtime_error(std::string("pwrite: ") + std::strerror(errno));
+            const int saved_errno = errno;
+            if(saved_errno == EINTR)continue;
+            throw_os_error("pwrite", saved_errno);
         }
-        if(flag == 0) throw std::runtime_error("we write zero bytes");
+        if(flag == 0) {
+            error_context context;
+            context.operation = "pwrite";
+            throw db_error(error_code::io_error, "pwrite made no progress", std::move(context));
+        }
         done += (size_t)flag;
     }
 }
@@ -144,18 +203,23 @@ file_header file_header::read_header(const page& p)
 
     header.magic_number = read_u32(ptr);
     if(header.magic_number != magic)
-        throw std::runtime_error("invalid magic number.");
+        throw db_error(error_code::invalid_format, "invalid magic number");
     ptr+= sizeof(header.magic_number);
 
     header.version = read_u32(ptr);
+    if(header.version != ver)
+        throw db_error(error_code::invalid_format, "unsupported file version");
     ptr += sizeof(header.version);
 
     header.page_size = read_u64(ptr);
     if(header.page_size != db::page_size)
-        throw std::runtime_error("page size mismatch");
+        throw db_error(error_code::invalid_format, "page size mismatch");
     ptr += sizeof(header.page_size);
 
     header.num_pages = read_u64(ptr);
+    const auto max_pages = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) / db::page_size;
+    if(header.num_pages == 0 || header.num_pages > max_pages)
+        throw db_error(error_code::invalid_format, "invalid page count");
 
     return header;
 }
@@ -165,7 +229,20 @@ file_header file_header::read_header(const page& p)
 file_handle::file_handle():num_pages(0),id(0),os_id(-1),dirty(false){}
 
 
-file_handle::file_handle(page_id npg,file_id fid,int oid):num_pages(npg),id(fid),os_id(oid),dirty(false){}
+file_handle::file_handle(page_id npg,file_id fid,int oid,std::string path)
+    :num_pages(npg),id(fid),os_id(oid),dirty(false),path_(std::move(path)){}
+
+error_context file_handle::context(const std::string& operation,
+                                   std::optional<page_id> pid) const
+{
+    error_context result;
+    result.operation = operation;
+    if (!path_.empty())
+        result.path = path_;
+    result.object_id = id;
+    result.page = pid;
+    return result;
+}
 
 
 file_handle::~file_handle()noexcept
@@ -174,8 +251,16 @@ file_handle::~file_handle()noexcept
         if(is_open())
             close();
     }
-    catch(std::exception & e)
+    catch(...)
     {
+        // A failed header write must not prevent final descriptor release.
+        // close() clears os_id before the system call, so an already-submitted
+        // close (including EIO/EINTR) is never retried here.
+        if (os_id != -1) {
+            const int owned_fd = os_id;
+            os_id = -1;
+            ::close(owned_fd);
+        }
     }
 }
 
@@ -189,14 +274,15 @@ bool file_handle::is_open()const
 off_t file_handle::calc_offset(page_id idx,bool append_back)const
 {
     if(!is_open())
-        throw std::runtime_error("this handle hasn't been assigned to any file yet.");
+        throw db_error(error_code::invalid_file_handle, "file handle is closed", context("page_offset", idx));
 
     if(!append_back && idx >= num_pages)
-        throw std::runtime_error("invalid page id.");
+        throw db_error(error_code::invalid_page, "page is outside the file", context("page_offset", idx));
 
     const uint64_t max_pages = (uint64_t)std::numeric_limits<off_t>::max() / page_size;
-    if(idx > max_pages)
-        throw std::runtime_error("page id is too large.");
+    // The entire page, not merely its starting offset, must fit in off_t.
+    if(idx >= max_pages)
+        throw db_error(error_code::invalid_page, "page extent exceeds the file offset range", context("page_offset", idx));
 
     return (off_t)idx * (off_t)page_size;
 }
@@ -205,23 +291,38 @@ off_t file_handle::calc_offset(page_id idx,bool append_back)const
 void file_handle::read_page(page_id idx,page& dest)const
 {
     off_t offset = calc_offset(idx);
-    safe_read(os_id,dest.data(),page_size,offset);
+    try {
+        safe_read(os_id,dest.data(),page_size,offset);
+    }
+    catch (const db_error& error) {
+        auto details = context("read_page", idx);
+        details.os_error = error.context().os_error;
+        throw db_error(error.code(), error.what(), std::move(details));
+    }
 }
 
 
 void file_handle::write_page(page_id idx,const page & src)
 {
     off_t offset = calc_offset(idx);
-    safe_write(os_id,(void*)src.data(),page_size,offset);
+    if (idx == 0)
+        throw db_error(error_code::invalid_page, "page zero is owned by the file manager", context("write_page", idx));
+    try {
+        safe_write(os_id,src.data(),page_size,offset);
+    }
+    catch (const db_error& error) {
+        auto details = context("write_page", idx);
+        details.os_error = error.context().os_error;
+        throw db_error(error.code(), error.what(), std::move(details));
+    }
 }
 
 
 page_id file_handle::allocate_page()
 {
-    off_t offset = calc_offset(num_pages,true);
-    safe_write(os_id,(void*)empty_page.data(),page_size,offset);
-    dirty = true;
-    return num_pages++;
+    const page_id result = num_pages;
+    append_page(empty_page);
+    return result;
 }
 
 
@@ -234,20 +335,37 @@ void file_handle::close()
     {
         std::byte buf[8];
         write_u64(buf,num_pages);
-        safe_write(os_id,buf,sizeof(buf),num_pages_offset);
+        try {
+            safe_write(os_id,buf,sizeof(buf),num_pages_offset);
+        }
+        catch (const db_error& error) {
+            auto details = context("save_file_header", 0);
+            details.os_error = error.context().os_error;
+            throw db_error(error.code(), error.what(), std::move(details));
+        }
+        dirty = false;
     }
 
-    if(::close(os_id) == -1)
-        throw std::runtime_error("fail to close file.");
-
+    const int owned_fd = os_id;
     os_id = -1;
+    if(::close(owned_fd) == -1) {
+        const int saved_errno = errno;
+        throw_os_error("close_file", saved_errno, context("close_file"));
+    }
 }
 
 
 void file_handle::append_page(const page & src)
 {
     off_t offset = calc_offset(num_pages,true);
-    safe_write(os_id,(void*)src.data(),page_size,offset);
+    try {
+        safe_write(os_id,src.data(),page_size,offset);
+    }
+    catch (const db_error& error) {
+        auto details = context("append_page", num_pages);
+        details.os_error = error.context().os_error;
+        throw db_error(error.code(), error.what(), std::move(details));
+    }
     ++num_pages;
     dirty = true;
 }
@@ -264,21 +382,44 @@ void file_manager::create_file(const std::string & path)const
 {
     std::string normalized_path = normalize_path(path);
     int os_id = ::open(normalized_path.c_str(),O_CREAT | O_EXCL | O_RDWR,FILE_MODE);
-    if(os_id == -1)
-        throw std::runtime_error("attempt to creat file that already exists.");
-    page p{};
-    fh.write_header(p);
-    try{
-        safe_write(os_id,p.data(),page_size,0);
+    if(os_id == -1) {
+        const int saved_errno = errno;
+        throw_os_error("create_file", saved_errno, path_context("create_file", normalized_path),
+                       path_error_code(saved_errno));
     }
-    catch(...){
-        ::close(os_id);
-        throw std::runtime_error("unable to write header into file after creating file.");
+    fd_guard guard(os_id);
+    // This manager is single-threaded and operates on its managed directory.
+    // Only the path successfully created by this call is eligible for cleanup.
+    const auto cleanup = [&]() noexcept -> int {
+        const int owned_fd = guard.release();
+        if (owned_fd != -1)
+            ::close(owned_fd); // Never retry a submitted close on Linux.
+        if (::unlink(normalized_path.c_str()) == -1)
+            return errno;
+        return 0;
+    };
+    try {
+        page p{};
+        fh.write_header(p);
+        safe_write(guard.get(),p.data(),page_size,0);
+        const int owned_fd = guard.release();
+        if (::close(owned_fd) == -1) {
+            const int saved_errno = errno;
+            throw_os_error("close_created_file", saved_errno);
+        }
     }
-
-    
-    if(::close(os_id) == -1)
-        throw std::runtime_error("unable to close file after creating file.");
+    catch (const db_error& error) {
+        const int cleanup_errno = cleanup();
+        auto details = error.context();
+        details.path = normalized_path;
+        if (cleanup_errno != 0)
+            details.cleanup_os_error = cleanup_errno;
+        throw db_error(error.code(), error.what(), std::move(details));
+    }
+    catch (...) {
+        cleanup();
+        throw;
+    }
 }
 
 
@@ -286,45 +427,65 @@ file_id file_manager::open_file(const std::string & maybe_un_normalized_path)
 {
     std::string path = normalize_path(maybe_un_normalized_path);
     if(filenames.find(path) != filenames.end())
-        throw std::runtime_error("attempt to open the same file twice.");
+        throw db_error(error_code::resource_busy, "file is already open",
+                       path_context("open_file", path));
+
+    if (next == std::numeric_limits<file_id>::max())
+        throw db_error(error_code::resource_limit, "file ID space exhausted",
+                       path_context("open_file", path));
     
     int os_id = ::open(path.c_str(),O_RDWR);
-    if(os_id == -1)
-        throw std::runtime_error("fail to open file.");
+    if(os_id == -1) {
+        const int saved_errno = errno;
+        throw_os_error("open_file", saved_errno, path_context("open_file", path),
+                       path_error_code(saved_errno));
+    }
     
     fd_guard guard = fd_guard(os_id);
-    page header_page{};
-    safe_read(guard.get(),header_page.data(),page_size,0);
-    
-    
-    file_header header = file_header::read_header(header_page);
-    if(header.version != ver)
-        throw std::runtime_error("invalid version of files");
-
-    const uint64_t max_pages = (uint64_t)std::numeric_limits<off_t>::max() / page_size;
-    if(header.num_pages == 0 || header.num_pages > max_pages)
-        throw std::runtime_error("invalid page count.");
-
     struct stat info{};
-    if(::fstat(guard.get(),&info) == -1)
-        throw std::runtime_error(std::string("fstat: ") + std::strerror(errno));
-    if(info.st_size < 0 || (uint64_t)info.st_size / page_size < header.num_pages)
-        throw std::runtime_error("file is smaller than the number of pages in its header.");
+    if(::fstat(guard.get(),&info) == -1) {
+        const int saved_errno = errno;
+        throw_os_error("fstat", saved_errno, path_context("open_file", path));
+    }
+    if (!S_ISREG(info.st_mode))
+        throw db_error(error_code::invalid_format, "page storage requires a regular file",
+                       path_context("open_file", path));
+    const physical_identity identity{info.st_dev, info.st_ino};
+    if (identities.find(identity) != identities.end())
+        throw db_error(error_code::resource_busy, "physical file is already open",
+                       path_context("open_file", path));
+
+    file_header header;
+    try {
+        page header_page{};
+        safe_read(guard.get(),header_page.data(),page_size,0);
+        header = file_header::read_header(header_page);
+        if(info.st_size < 0 || static_cast<std::uint64_t>(info.st_size) / page_size < header.num_pages)
+            throw db_error(error_code::invalid_format,
+                           "file is smaller than the page count in its header");
+    }
+    catch (const db_error& error) {
+        auto details = error.context();
+        details.operation = "open_file";
+        details.path = path;
+        details.page = 0;
+        throw db_error(error.code(), error.what(), std::move(details));
+    }
 
     file_id id = next;
-    file_handle* fh = new file_handle(header.num_pages,id,guard.get());
+    auto handle = std::make_unique<file_handle>(header.num_pages,id,guard.get(),path);
     guard.release();
+    open_file_entry entry{std::move(handle), path, identity};
 
     try{
-        file_handles.emplace(id,fh);
+        file_handles.emplace(id,std::move(entry));
         filenames.emplace(path,id);
-        idx2name.emplace(id,path);
+        identities.emplace(identity,id);
     }
     catch(...){
         file_handles.erase(id);
         filenames.erase(path);
-        idx2name.erase(id);
-        delete fh;
+        identities.erase(identity);
         throw;
     }
 
@@ -336,28 +497,37 @@ file_id file_manager::open_file(const std::string & maybe_un_normalized_path)
 void file_manager::close_file(file_id id)
 {
     auto it = file_handles.find(id);
-    if(it == file_handles.end())
-        throw std::runtime_error("attempt to close unopened or double close file.");
-    
-    file_handle * fh = it->second;
-    std::string name = idx2name[id];
+    if(it == file_handles.end()) {
+        error_context details;
+        details.operation = "close_file";
+        details.object_id = id;
+        throw db_error(error_code::invalid_file_handle, "file ID is not open", std::move(details));
+    }
 
-    fh->close();
-    delete fh;
-
-    file_handles.erase(it);
-    filenames.erase(name);
-    idx2name.erase(id);
+    try {
+        it->second.handle->close();
+    }
+    catch (...) {
+        // A header-save failure retains a live descriptor for explicit retry.
+        // A submitted system close invalidates the descriptor even on failure.
+        if (!it->second.handle->is_open())
+            unregister_file(id);
+        throw;
+    }
+    unregister_file(id);
 }
 
-file_manager::~file_manager()
+void file_manager::unregister_file(file_id id)noexcept
 {
-    for(auto& it:file_handles)
-        delete it.second;
-    file_handles.clear();
-    filenames.clear();
-    idx2name.clear();
+    auto it = file_handles.find(id);
+    if (it == file_handles.end())
+        return;
+    filenames.erase(it->second.path);
+    identities.erase(it->second.identity);
+    file_handles.erase(it);
 }
+
+file_manager::~file_manager() = default;
 
 
 void file_manager::remove_file(const std::string & path)
@@ -365,20 +535,38 @@ void file_manager::remove_file(const std::string & path)
     std::string normalized_path = normalize_path(path);
     auto it = filenames.find(normalized_path);
     if(it != filenames.end())
-        throw std::runtime_error("can't remove opened files");
+        throw db_error(error_code::resource_busy, "cannot remove an open file",
+                       path_context("remove_file", normalized_path));
+
+    struct stat info{};
+    if (::stat(normalized_path.c_str(), &info) == -1) {
+        const int saved_errno = errno;
+        throw_os_error("stat", saved_errno, path_context("remove_file", normalized_path),
+                       path_error_code(saved_errno));
+    }
+    if (identities.find({info.st_dev, info.st_ino}) != identities.end())
+        throw db_error(error_code::resource_busy, "cannot remove an alias of an open file",
+                       path_context("remove_file", normalized_path));
     
-    if(::unlink(normalized_path.c_str()) == -1)
-        throw std::runtime_error("fail to remove file.");
+    if(::unlink(normalized_path.c_str()) == -1) {
+        const int saved_errno = errno;
+        throw_os_error("unlink", saved_errno, path_context("remove_file", normalized_path),
+                       path_error_code(saved_errno));
+    }
 }
 
 
 file_handle & file_manager::get_file(file_id id)
 {
     auto it = file_handles.find(id);
-    if(it == file_handles.end())
-        throw std::runtime_error("this file does not exists.");
+    if(it == file_handles.end()) {
+        error_context details;
+        details.operation = "get_file";
+        details.object_id = id;
+        throw db_error(error_code::invalid_file_handle, "file ID is not open", std::move(details));
+    }
     
-    return *it->second;
+    return *it->second.handle;
 } 
 
 

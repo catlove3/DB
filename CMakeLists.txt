@@ -22,7 +22,7 @@ function(idbs_configure_target target)
     endif()
 endfunction()
 
-add_library(db_common STATIC src/common/cli.cpp)
+add_library(db_common STATIC src/common/cli.cpp src/common/error.cpp)
 target_include_directories(db_common PUBLIC "${PROJECT_SOURCE_DIR}/include")
 idbs_configure_target(db_common)
 
@@ -47,6 +47,17 @@ if(BUILD_TESTING)
     idbs_configure_target(unit_file_manager)
     add_test(NAME unit_file_manager COMMAND unit_file_manager)
     set_tests_properties(unit_file_manager PROPERTIES TIMEOUT 30)
+
+    # Linux fault injection wraps calls made by the static storage library.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(unit_storage_failures tests/unit/test_storage_failures.cpp)
+        target_link_libraries(unit_storage_failures PRIVATE db_storage)
+        idbs_configure_target(unit_storage_failures)
+        target_link_options(unit_storage_failures PRIVATE
+            -Wl,--wrap=close -Wl,--wrap=pread -Wl,--wrap=pwrite -Wl,--wrap=unlink)
+        add_test(NAME unit_storage_failures COMMAND unit_storage_failures)
+        set_tests_properties(unit_storage_failures PROPERTIES TIMEOUT 30)
+    endif()
 
     add_executable(unit_buffer_pool tests/unit/test_buffer_pool.cpp)
     target_link_libraries(unit_buffer_pool PRIVATE db_storage)

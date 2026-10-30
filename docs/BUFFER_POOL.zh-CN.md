@@ -5,11 +5,13 @@
 [`test_buffer_pool.cpp`](../tests/unit/test_buffer_pool.cpp)。本模块是单线程页缓存，
 通过 `file_manager` 进行同步页读写；页大小为 8192 字节。
 
+2026-10-31 起，主动报告的错误统一为 `db_error`，新增 `close_file()` 负责缓存和文件的协调关闭。错误码和失败状态见 [底层错误和文件生命周期](STORAGE_ERRORS.zh-CN.md)。
+
 ## 1. 页、帧和索引
 
 `page_id` 是文件内的页号，`frame_id` 是缓冲池内存槽的编号。页的完整身份是
 `(file_id, page_id)`，两个文件可以拥有相同页号。文件的第 0 页由文件管理器保存
-文件头，`new_page()` 分配的数据页从第 1 页开始。
+文件头，BPM 拒绝 fetch/flush/evict/discard page 0；`new_page()` 分配的数据页从第 1 页开始。
 
 每个 `frame` 保存页字节、文件 ID、页号、`valid`、`dirty` 和 `pin_count`。
 构造时固定分配所有 frame，guard 存活期间底层页地址不会因扩容而变化。
@@ -68,14 +70,14 @@ fm.close_file(fid);
 
 `fetch_page()` 命中时更新 LRU 顺序并返回 guard。缺页时优先从 free list 取帧；
 没有空帧时，从 LRU 尾部查找未被 pin 的候选。脏候选成功写回后才删除旧映射，
-随后读取新页并发布两份索引。全部帧被 pin 时抛出 `std::runtime_error`。
+随后读取新页并发布两份索引。全部帧被 pin 时抛出 `db_error(error_code::buffer_exhausted)`。
 
 `new_page()` 先取得帧，再调用 `file_handle::allocate_page()`，使缓存耗尽时不会
 额外分配磁盘页。磁盘分配会写入零页，因此缓存中的新页初始为干净的零页。
 请求可写字节后才标脏。它返回可写 guard。
 
 帧数必须大于 0，且不能超过 `invalid_frame_id`；非法容量抛出
-`std::invalid_argument`。BPM 不可复制或移动。
+`db_error(error_code::invalid_argument)`。BPM 不可复制或移动。
 
 ## 3. Guard、pin 和 dirty
 
@@ -109,6 +111,7 @@ BPM 必须先于它引用的 file_manager 销毁。
 | `evict_page(fid, pid)` | 必要时写回、删除索引并归还 frame | 未缓存或 pinned 返回 false |
 | `discard_page(fid, pid)` | 放弃缓存内容、删除索引并归还 frame | 未缓存或 pinned 返回 false |
 | `flush_and_invalidate_file(fid)` | 刷新并移除该文件所有驻留页，返回移除页数 | 无驻留页返回 0；存在 pin 则抛异常 |
+| `close_file(fid)` | 刷新并失效该文件缓存，再保存文件头并关闭句柄 | 未打开 fid 报 invalid_file_handle；存在 pin 报 resource_busy |
 | `shutdown()` | 刷新并清空缓存，保留统计信息 | 存在 pin 则抛异常 |
 
 `discard_page()` 不写回脏内容，也不释放磁盘页。只有确定要放弃内存修改或删除
@@ -117,12 +120,11 @@ BPM 必须先于它引用的 file_manager 销毁。
 关闭一个文件的顺序是：释放该文件的所有 guard，再执行：
 
 ```cpp
-bpm.flush_and_invalidate_file(fid);
-fm.close_file(fid);
+bpm.close_file(fid);
 ```
 
 该操作先检查整个文件的 pin，再刷新所有脏页，全部写入成功后才逐页移除映射。
-关闭失败时可以保留缓存并处理异常。文件重开会获得新的 file ID。
+缓存写回失败时保留映射；文件头保存失败时缓存可能已移除，但文件仍打开。真正调用系统 close 后，无论其是否报告错误，都注销旧句柄，不能再重试旧 fd。文件重开会获得新的 file ID。
 
 `shutdown()` 先检查所有 pin，再刷新，然后清空页表、文件索引和 LRU、重置 frame、
 恢复 free list。重复调用安全；当前实现允许 reset 后继续使用同一个 BPM。
@@ -157,9 +159,10 @@ fm.close_file(fid);
 | `writebacks` | 成功完成的脏页写回次数；同一页重复写回分别计数 |
 
 new_page 不计 hit/miss；discard、文件失效和 shutdown 清理不计 eviction。
+fetch 在查询缓存前验证句柄、页号和访问模式，入口校验拒绝不计 hit/miss，也不淘汰旧页；已关闭文件不能靠缓存命中继续读取。
 `stats()` 返回只读引用，shutdown 不清零计数。
 
-`check_invariants()` 是显式调用的调试方法，发现问题抛出 `std::logic_error`。
+`check_invariants()` 是显式调用的调试方法，发现问题抛出 `db_error(error_code::internal_error)`。
 它使用 O(N) 时间和 O(N) 临时空间，检查：
 
 - 有效 frame、页表和文件索引的身份与数量双向一致，没有空文件桶。
@@ -190,3 +193,5 @@ BPM 测试使用独立临时目录，覆盖辅助结构、guard 移动、pin、L
 关闭重开、文件索引隔离、flush 后继续写、discard、实际 I/O 失败、析构兜底，
 以及固定随机种子的 500 次多文件操作。测试检查实际磁盘字节，并在状态变化后
 调用 check_invariants；Release 构建也会执行检查。
+
+另有 Linux 专用 `unit_storage_failures`，用系统调用包装注入关闭失败、文件头写失败、清理失败、短读写与 EINTR，验证错误码及故障后的文件/句柄状态。生产库仍调用真实系统接口，故障注入只存在于这个测试可执行文件。

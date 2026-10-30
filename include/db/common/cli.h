@@ -16,7 +16,7 @@ struct CliOptions {
     std::string import_table;
 };
 
-// Throws std::invalid_argument for unknown flags or invalid combinations.
+// Throws db_error(invalid_argument) for unknown flags or invalid combinations.
 CliOptions parse_cli(int argc, char* argv[]);
 void print_help(std::ostream& output);
 

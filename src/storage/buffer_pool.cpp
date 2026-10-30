@@ -2,16 +2,35 @@
 #include "db/common/types.h"
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace db
 {
 
 namespace {
 
+db_error pool_error(error_code code, const char* message, const char* operation,
+                    std::optional<file_id> fid = {}, std::optional<page_id> pid = {})
+{
+    error_context context;
+    context.operation = operation;
+    context.object_id = fid;
+    context.page = pid;
+    return db_error(code, message, std::move(context));
+}
+
+void require_data_page(file_id fid, page_id pid, const char* operation)
+{
+    if (pid == 0)
+        throw pool_error(error_code::invalid_page,
+                         "file header page cannot be cached", operation, fid, pid);
+}
+
 std::size_t checked_frame_count(std::size_t count)
 {
     if (count == 0 || count > invalid_frame_id)
-        throw std::invalid_argument("invalid buffer pool frame count");
+        throw pool_error(error_code::invalid_argument,
+                         "invalid buffer pool frame count", "buffer_pool.capacity");
     return count;
 }
 
@@ -738,7 +757,8 @@ void buffer_pool_manager::add_mapping(frame_id fid)
 
     try {
         if (!file_it->second.insert(fr.pid).second)
-            throw std::logic_error("duplicate file-page mapping");
+            throw pool_error(error_code::internal_error, "duplicate file-page mapping",
+                             "buffer_pool.add_mapping", fr.fid, fr.pid);
     }
     catch (...) {
         if (result.second && file_it->second.empty())
@@ -748,7 +768,8 @@ void buffer_pool_manager::add_mapping(frame_id fid)
 
     try {
         if (!table.insert(fr.fid, fr.pid, fid))
-            throw std::logic_error("duplicate page mapping");
+            throw pool_error(error_code::internal_error, "duplicate page mapping",
+                             "buffer_pool.add_mapping", fr.fid, fr.pid);
     }
     catch (...) {
         file_it->second.erase(fr.pid);
@@ -789,6 +810,17 @@ buffer_pool_manager::buffer_pool_manager(file_manager & fm_,std::size_t frame_co
 
 page_guard buffer_pool_manager::fetch_page(file_id fid,page_id pid,access_type access)
 {
+    require_data_page(fid, pid, "buffer_pool.fetch_page");
+    if (access != access_type::read && access != access_type::write)
+        throw pool_error(error_code::invalid_argument, "invalid page access mode",
+                         "buffer_pool.fetch_page", fid, pid);
+    db::file_handle & fh = fm.get_file(fid);
+    if (!fh.is_open())
+        throw pool_error(error_code::invalid_file_handle, "file handle is closed",
+                         "buffer_pool.fetch_page", fid, pid);
+    if (pid >= fh.get_num_pages())
+        throw pool_error(error_code::invalid_page, "page ID is out of range",
+                         "buffer_pool.fetch_page", fid, pid);
     //先从buffer pool之中寻找
     frame_id candidate = find_frame(fid,pid);
     bool can_write = (access == access_type::write);
@@ -800,10 +832,10 @@ page_guard buffer_pool_manager::fetch_page(file_id fid,page_id pid,access_type a
     }
 
     stat.misses += 1;
-    db::file_handle & fh = fm.get_file(fid);
     candidate = acquire_frame();
     if(candidate == invalid_frame_id)
-        throw std::runtime_error("buffer pool exhausted");
+        throw pool_error(error_code::buffer_exhausted, "buffer pool exhausted",
+                         "buffer_pool.fetch_page", fid, pid);
 
     frame * fr = get_frame(candidate);
     try{
@@ -828,9 +860,13 @@ page_guard buffer_pool_manager::fetch_page(file_id fid,page_id pid,access_type a
 page_guard buffer_pool_manager::new_page(file_id fid)
 {
     db::file_handle & fh = fm.get_file(fid);
+    if (!fh.is_open())
+        throw pool_error(error_code::invalid_file_handle, "file handle is closed",
+                         "buffer_pool.new_page", fid);
     frame_id id = acquire_frame();
     if(id == invalid_frame_id)
-        throw std::runtime_error("buffer pool exhausted");
+        throw pool_error(error_code::buffer_exhausted, "buffer pool exhausted",
+                         "buffer_pool.new_page", fid);
 
     frame & _frame = frames[id];
     try{
@@ -851,6 +887,7 @@ page_guard buffer_pool_manager::new_page(file_id fid)
 
 bool buffer_pool_manager::flush_page(file_id fid, page_id pid)
 {
+    require_data_page(fid, pid, "buffer_pool.flush_page");
     frame_id candidate = find_frame(fid,pid);
     if(candidate == invalid_frame_id)
         return false;
@@ -892,6 +929,7 @@ std::size_t buffer_pool_manager::flush_all()
 
 bool buffer_pool_manager::evict_page(file_id fid, page_id pid)
 {
+    require_data_page(fid, pid, "buffer_pool.evict_page");
     frame_id id = find_frame(fid, pid);
     if (id == invalid_frame_id || frames[id].pin_count != 0)
         return false;
@@ -908,6 +946,7 @@ bool buffer_pool_manager::evict_page(file_id fid, page_id pid)
 
 bool buffer_pool_manager::discard_page(file_id fid, page_id pid)
 {
+    require_data_page(fid, pid, "buffer_pool.discard_page");
     frame_id id = find_frame(fid, pid);
     if (id == invalid_frame_id || frames[id].pin_count != 0)
         return false;
@@ -927,7 +966,8 @@ std::size_t buffer_pool_manager::flush_and_invalidate_file(file_id fid)
 
     for (page_id pid : file_it->second) {
         if (frames[find_frame(fid, pid)].pin_count != 0)
-            throw std::runtime_error("file still has pinned pages");
+            throw pool_error(error_code::resource_busy, "file still has pinned pages",
+                             "buffer_pool.flush_and_invalidate_file", fid, pid);
     }
 
     // Keep every mapping until all writes have succeeded.
@@ -942,11 +982,20 @@ std::size_t buffer_pool_manager::flush_and_invalidate_file(file_id fid)
     return count;
 }
 
+void buffer_pool_manager::close_file(file_id fid)
+{
+    // Validate before changing the cache, including calls on unknown handles.
+    (void)fm.get_file(fid);
+    flush_and_invalidate_file(fid);
+    fm.close_file(fid);
+}
+
 void buffer_pool_manager::shutdown()
 {
     for (const db::frame & fr : frames) {
         if (fr.pin_count != 0)
-            throw std::runtime_error("buffer pool still has pinned pages");
+            throw pool_error(error_code::resource_busy, "buffer pool still has pinned pages",
+                             "buffer_pool.shutdown", fr.fid, fr.pid);
     }
     flush_all();
     table.clear();
@@ -993,7 +1042,7 @@ void buffer_pool_manager::check_invariants() const
 {
     auto require = [](bool ok, const char * message) {
         if (!ok)
-            throw std::logic_error(message);
+            throw pool_error(error_code::internal_error, message, "buffer_pool.check_invariants");
     };
 
     const std::size_t capacity = frames.size();

@@ -1,11 +1,14 @@
 #pragma once
 
 #include "db/common/types.h"
+#include "db/common/error.h"
 #include <cstddef>
+#include <map>
+#include <memory>
 #include <unordered_map>
-#include <unordered_set>
 #include <string>
 #include <cstdint>
+#include <utility>
 #include <sys/types.h>   // off_t
 
 namespace db{
@@ -51,15 +54,19 @@ namespace db{
         file_id id;
         int os_id;
         bool dirty;
+        std::string path_;
+        error_context context(const std::string& operation,
+                              std::optional<page_id> pid = std::nullopt) const;
         off_t calc_offset(page_id idx,bool append_back = false)const;
         file_handle(const file_handle & fh) = delete;
         file_handle & operator=(const file_handle & fh) =delete;
     public:
         file_handle();
-        file_handle(page_id npg,file_id fid,int oid);
-        ~file_handle();
+        file_handle(page_id npg,file_id fid,int oid, std::string path = {});
+        ~file_handle()noexcept;
         bool is_open()const;
         void read_page(page_id idx,page& dest)const;
+        // Page zero is owned by the file manager; diagnostic reads are allowed.
         void write_page(page_id idx,const page & src);
         page_id allocate_page();
         void close();
@@ -72,10 +79,17 @@ namespace db{
     class file_manager
     {
     private:
+        using physical_identity = std::pair<dev_t, ino_t>;
+        struct open_file_entry {
+            std::unique_ptr<file_handle> handle;
+            std::string path;
+            physical_identity identity;
+        };
         file_id next;
-        std::unordered_map<file_id,file_handle*> file_handles;
+        std::unordered_map<file_id,open_file_entry> file_handles;
         std::unordered_map<std::string,file_id> filenames;
-        std::unordered_map<file_id,std::string> idx2name;
+        std::map<physical_identity,file_id> identities;
+        void unregister_file(file_id id)noexcept;
         file_manager(const file_manager & fm) = delete;
         file_manager & operator=(const file_manager & fm) =delete;
     public:

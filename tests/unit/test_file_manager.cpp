@@ -1,4 +1,5 @@
 #include "db/storage/file_manager.h"
+#include "db/common/error.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,13 +29,13 @@ int failures = 0;
     } while(false)
 
 template<class F>
-bool throws(F&& f)
+bool throws(error_code expected, F&& f)
 {
     try {
         f();
     }
-    catch(const std::exception&) {
-        return true;
+    catch(const db_error& error) {
+        return error.code() == expected;
     }
     return false;
 }
@@ -109,13 +110,13 @@ void test_create_open_close_remove(temp_dir& tmp)
 
     fm.create_file(path.string());
     CHECK(fs::exists(path));
-    CHECK(throws([&] { fm.create_file(path.string()); }));
+    CHECK(throws(error_code::object_exists, [&] { fm.create_file(path.string()); }));
 
     const file_id id = fm.open_file(path.string());
     file_handle& handle = fm.get_file(id);
     CHECK(handle.is_open());
-    CHECK(throws([&] { fm.open_file(path.string()); }));
-    CHECK(throws([&] { fm.remove_file(path.string()); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.open_file(path.string()); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.remove_file(path.string()); }));
 
     page data{};
     for(std::size_t i = 0; i < data.size(); ++i)
@@ -127,16 +128,17 @@ void test_create_open_close_remove(temp_dir& tmp)
     page out{};
     handle.read_page(1, out);
     CHECK(out == data);
-    CHECK(throws([&] { handle.read_page(2, out); }));
-    CHECK(throws([&] { handle.write_page(2, data); }));
+    CHECK(throws(error_code::invalid_page, [&] { handle.write_page(0, data); }));
+    CHECK(throws(error_code::invalid_page, [&] { handle.read_page(2, out); }));
+    CHECK(throws(error_code::invalid_page, [&] { handle.write_page(2, data); }));
 
     page appended{};
     appended.fill(std::byte{0x5a});
     handle.append_page(appended);
 
     fm.close_file(id);
-    CHECK(throws([&] { fm.close_file(id); }));
-    CHECK(throws([&] { fm.get_file(id); }));
+    CHECK(throws(error_code::invalid_file_handle, [&] { fm.close_file(id); }));
+    CHECK(throws(error_code::invalid_file_handle, [&] { fm.get_file(id); }));
 
     const file_id reopened_id = fm.open_file(path.string());
     CHECK(reopened_id != id);
@@ -152,8 +154,8 @@ void test_create_open_close_remove(temp_dir& tmp)
 
     fm.remove_file(path.string());
     CHECK(!fs::exists(path));
-    CHECK(throws([&] { fm.open_file(path.string()); }));
-    CHECK(throws([&] { fm.remove_file(path.string()); }));
+    CHECK(throws(error_code::object_not_found, [&] { fm.open_file(path.string()); }));
+    CHECK(throws(error_code::object_not_found, [&] { fm.remove_file(path.string()); }));
 }
 
 void test_path_aliases(temp_dir& tmp)
@@ -166,14 +168,14 @@ void test_path_aliases(temp_dir& tmp)
     const file_id id = fm.open_file(path.string());
 
     CHECK(normalize_path(path.string()) == normalize_path(dot_alias.string()));
-    CHECK(throws([&] { fm.open_file(dot_alias.string()); }));
-    CHECK(throws([&] { fm.remove_file(dot_alias.string()); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.open_file(dot_alias.string()); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.remove_file(dot_alias.string()); }));
 
     const fs::path old_cwd = fs::current_path();
     fs::current_path(tmp.path);
     CHECK(normalize_path("alias.db") == normalize_path(path.string()));
-    CHECK(throws([&] { fm.open_file("alias.db"); }));
-    CHECK(throws([&] { fm.remove_file("alias.db"); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.open_file("alias.db"); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.remove_file("alias.db"); }));
     fs::current_path(old_cwd);
 
     fm.close_file(id);
@@ -231,7 +233,7 @@ void test_invalid_headers(temp_dir& tmp)
     const fs::path bad_magic = tmp.path / "bad_magic.db";
     fm.create_file(bad_magic.string());
     mutate_header(bad_magic, [](page& p) { write_u32(p.data() + 0, 0); });
-    CHECK(throws([&] { fm.open_file(bad_magic.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(bad_magic.string()); }));
     fm.remove_file(bad_magic.string());
 
     const fs::path bad_version = tmp.path / "bad_version.db";
@@ -239,7 +241,7 @@ void test_invalid_headers(temp_dir& tmp)
     mutate_header(bad_version, [](page& p) {
         write_u32(p.data() + 4, read_u32(p.data() + 4) + 1);
     });
-    CHECK(throws([&] { fm.open_file(bad_version.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(bad_version.string()); }));
     fm.remove_file(bad_version.string());
 
     const fs::path bad_page_size = tmp.path / "bad_page_size.db";
@@ -247,7 +249,7 @@ void test_invalid_headers(temp_dir& tmp)
     mutate_header(bad_page_size, [](page& p) {
         write_u64(p.data() + 8, page_size * 2);
     });
-    CHECK(throws([&] { fm.open_file(bad_page_size.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(bad_page_size.string()); }));
     fm.remove_file(bad_page_size.string());
 
     const fs::path zero_pages = tmp.path / "zero_pages.db";
@@ -255,7 +257,7 @@ void test_invalid_headers(temp_dir& tmp)
     mutate_header(zero_pages, [](page& p) {
         write_u64(p.data() + 16, 0);
     });
-    CHECK(throws([&] { fm.open_file(zero_pages.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(zero_pages.string()); }));
     fm.remove_file(zero_pages.string());
 
     const fs::path huge_pages = tmp.path / "huge_pages.db";
@@ -263,7 +265,7 @@ void test_invalid_headers(temp_dir& tmp)
     mutate_header(huge_pages, [](page& p) {
         write_u64(p.data() + 16, (uint64_t)-1);
     });
-    CHECK(throws([&] { fm.open_file(huge_pages.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(huge_pages.string()); }));
     fm.remove_file(huge_pages.string());
 }
 
@@ -280,10 +282,10 @@ void test_truncated_file(temp_dir& tmp)
     fm.close_file(id);
 
     fs::resize_file(path, page_size);
-    CHECK(throws([&] { fm.open_file(path.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(path.string()); }));
 
     fs::resize_file(path, 0);
-    CHECK(throws([&] { fm.open_file(path.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(path.string()); }));
 
     fm.remove_file(path.string());
 }
@@ -298,8 +300,42 @@ void test_short_file(temp_dir& tmp)
         out.write("abc", 3);
     }
 
-    CHECK(throws([&] { fm.open_file(path.string()); }));
+    CHECK(throws(error_code::invalid_format, [&] { fm.open_file(path.string()); }));
     fm.remove_file(path.string());
+}
+
+void test_hardlink_identity(temp_dir& tmp)
+{
+    file_manager fm;
+    const fs::path original = tmp.path / "hardlink.db";
+    const fs::path alias = tmp.path / "hardlink_alias.db";
+    fm.create_file(original.string());
+    fs::create_hard_link(original, alias);
+    const file_id id = fm.open_file(original.string());
+    CHECK(throws(error_code::resource_busy, [&] { fm.open_file(alias.string()); }));
+    CHECK(throws(error_code::resource_busy, [&] { fm.remove_file(alias.string()); }));
+    CHECK(fs::exists(original) && fs::exists(alias));
+    CHECK(fm.get_file(id).allocate_page() == 1);
+    fm.close_file(id);
+    const file_id reopened = fm.open_file(alias.string());
+    CHECK(fm.get_file(reopened).get_num_pages() == 2);
+    fm.close_file(reopened);
+    fm.remove_file(alias.string());
+    CHECK(fs::exists(original) && !fs::exists(alias));
+    fm.remove_file(original.string());
+}
+
+void test_error_categories(temp_dir& tmp)
+{
+    file_manager fm;
+    const auto missing = (tmp.path / "missing_parent" / "new.db").string();
+    CHECK(throws(error_code::object_not_found, [&] { fm.create_file(missing); }));
+    CHECK(throws(error_code::object_not_found, [&] { fm.open_file(missing); }));
+    CHECK(throws(error_code::object_not_found, [&] { fm.remove_file(missing); }));
+    file_handle closed;
+    page bytes{};
+    CHECK(throws(error_code::invalid_file_handle, [&] { closed.read_page(0, bytes); }));
+    CHECK(throws(error_code::invalid_file_handle, [&] { closed.allocate_page(); }));
 }
 
 }
@@ -316,6 +352,8 @@ int main()
         test_invalid_headers(tmp);
         test_truncated_file(tmp);
         test_short_file(tmp);
+        test_hardlink_identity(tmp);
+        test_error_categories(tmp);
     }
     catch(const std::exception& e) {
         std::cerr << "unexpected exception: " << e.what() << '\n';

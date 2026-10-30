@@ -26,11 +26,11 @@ int failures = 0;
         } \
     } while (false)
 
-template<class Exception = std::exception, class F>
-bool throws(F && f)
+template<class F>
+bool throws_code(error_code code, F && f)
 {
     try { f(); }
-    catch (const Exception &) { return true; }
+    catch (const db_error & error) { return error.code() == code; }
     return false;
 }
 
@@ -81,7 +81,7 @@ void test_helpers()
     table.clear();
     CHECK(table.empty());
 
-    CHECK(throws<std::invalid_argument>([] { free_list list(0); }));
+    CHECK(throws_code(error_code::invalid_argument, [] { free_list list(0); }));
     free_list free(3);
     CHECK(free.get_empty_frame() == 0);
     CHECK(free.get_empty_frame() == 1);
@@ -133,8 +133,8 @@ void test_guard_and_stats(temp_dir & tmp)
     static_assert(std::is_nothrow_move_assignable_v<page_guard>);
     file_manager fm;
     file_id fid = create_file(fm, tmp.path / "guards.db");
-    CHECK(throws<std::invalid_argument>([&] { buffer_pool_manager bpm(fm, 0); }));
-    CHECK(throws<std::invalid_argument>([&] {
+    CHECK(throws_code(error_code::invalid_argument, [&] { buffer_pool_manager bpm(fm, 0); }));
+    CHECK(throws_code(error_code::invalid_argument, [&] {
         buffer_pool_manager bpm(fm, static_cast<std::size_t>(invalid_frame_id) + 1);
     }));
     buffer_pool_manager bpm(fm, 2);
@@ -236,16 +236,16 @@ void test_lru_and_exhaustion(temp_dir & tmp)
     auto b = bpm.fetch_page(fid, ids[1]);
     auto c = bpm.fetch_page(fid, ids[2]);
     const page_id before = fm.get_file(fid).get_num_pages();
-    CHECK(throws([&] { auto g = bpm.new_page(fid); }));
+    CHECK(throws_code(error_code::buffer_exhausted, [&] { auto g = bpm.new_page(fid); }));
     CHECK(fm.get_file(fid).get_num_pages() == before);
-    CHECK(throws([&] { auto g = bpm.fetch_page(fid, 0); }));
+    CHECK(throws_code(error_code::invalid_page, [&] { auto g = bpm.fetch_page(fid, 0); }));
     CHECK(!bpm.evict_page(fid, ids[0]) && !bpm.discard_page(fid, ids[0]));
-    CHECK(throws([&] { bpm.shutdown(); }));
-    CHECK(throws([&] { bpm.flush_and_invalidate_file(fid); }));
+    CHECK(throws_code(error_code::resource_busy, [&] { bpm.shutdown(); }));
+    CHECK(throws_code(error_code::resource_busy, [&] { bpm.flush_and_invalidate_file(fid); }));
     CHECK(a && b && c && a.page_no() == ids[0]);
     bpm.check_invariants();
     c.release();
-    { auto g = bpm.fetch_page(fid, 0); }
+    { auto g = bpm.fetch_page(fid, before - 1); }
     bpm.check_invariants();
 }
 
@@ -315,7 +315,7 @@ void test_file_index_and_close(temp_dir & tmp)
     CHECK(bpm.flush_file(9999) == 0 && bpm.flush_and_invalidate_file(9999) == 0);
     auto pinned = bpm.fetch_page(a, a_pages[0]);
     auto writes = bpm.stats().writebacks;
-    CHECK(throws([&] { bpm.flush_and_invalidate_file(a); }));
+    CHECK(throws_code(error_code::resource_busy, [&] { bpm.flush_and_invalidate_file(a); }));
     CHECK(bpm.cached_page_count() == 3 && bpm.stats().writebacks == writes);
     pinned.release();
     CHECK(bpm.flush_and_invalidate_file(a) == 2);
@@ -343,30 +343,78 @@ void test_read_and_write_failures(temp_dir & tmp)
     page_id pid = fh.allocate_page();
     page_id other = fh.allocate_page();
     buffer_pool_manager bpm(fm, 1);
-    CHECK(throws([&] { auto g = bpm.fetch_page(9999, pid); }));
-    CHECK(throws([&] { auto g = bpm.new_page(9999); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { auto g = bpm.fetch_page(9999, pid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { auto g = bpm.new_page(9999); }));
     CHECK(bpm.free_frame_count() == 1);
-    CHECK(throws([&] { auto g = bpm.fetch_page(fid, 9999); }));
+    CHECK(throws_code(error_code::invalid_page, [&] { auto g = bpm.fetch_page(fid, 9999); }));
     CHECK(bpm.free_frame_count() == 1);
     bpm.check_invariants();
     { auto g = bpm.fetch_page(fid, pid, access_type::write); *g.get() = pattern_page(30); }
     auto evictions = bpm.stats().evictions;
     auto writes = bpm.stats().writebacks;
     fh.close(); // inject a real write failure while keeping cached metadata
-    CHECK(throws([&] { bpm.flush_page(fid, pid); }));
-    CHECK(throws([&] { bpm.flush_file(fid); }));
-    CHECK(throws([&] { bpm.flush_and_invalidate_file(fid); }));
-    CHECK(throws([&] { auto g = bpm.fetch_page(fid, other); }));
-    CHECK(throws([&] { bpm.evict_page(fid, pid); }));
-    CHECK(throws([&] { bpm.shutdown(); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { bpm.flush_page(fid, pid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { bpm.flush_file(fid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { bpm.flush_and_invalidate_file(fid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { auto g = bpm.fetch_page(fid, other); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { bpm.evict_page(fid, pid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { bpm.shutdown(); }));
     CHECK(bpm.stats().evictions == evictions && bpm.stats().writebacks == writes);
     CHECK(bpm.cached_page_count() == 1 && bpm.free_frame_count() == 0);
-    { auto g = bpm.fetch_page(fid, pid); CHECK(*g.view() == pattern_page(30)); }
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { auto g = bpm.fetch_page(fid, pid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { auto g = bpm.new_page(fid); }));
     bpm.check_invariants();
     CHECK(bpm.discard_page(fid, pid)); // intentionally abandon this failed write
     bpm.check_invariants();
     fm.close_file(fid);
     CHECK(bpm.flush_file(fid) == 0);
+    bpm.shutdown();
+}
+
+void test_reserved_header_and_close(temp_dir & tmp)
+{
+    file_manager fm;
+    const auto path = tmp.path / "reserved_header.db";
+    file_id fid = create_file(fm, path);
+    buffer_pool_manager bpm(fm, 1);
+    auto guard = bpm.new_page(fid);
+    const auto pid = guard.page_no();
+    *guard.get() = pattern_page(55);
+    const auto before = bpm.stats();
+
+    CHECK(throws_code(error_code::invalid_page, [&] { auto g = bpm.fetch_page(fid, 0); }));
+    CHECK(throws_code(error_code::invalid_page, [&] { bpm.flush_page(fid, 0); }));
+    CHECK(throws_code(error_code::invalid_page, [&] { bpm.evict_page(fid, 0); }));
+    CHECK(throws_code(error_code::invalid_page, [&] { bpm.discard_page(fid, 0); }));
+    CHECK(throws_code(error_code::invalid_argument, [&] {
+        auto g = bpm.fetch_page(fid, pid, static_cast<access_type>(99));
+    }));
+    CHECK(throws_code(error_code::resource_busy, [&] { bpm.close_file(fid); }));
+    CHECK(fm.get_file(fid).is_open() && guard && *guard.view() == pattern_page(55));
+    guard.release();
+
+    // Reject bad input before it can evict or flush the sole dirty frame.
+    try {
+        auto g = bpm.fetch_page(fid, 12345);
+        CHECK(false);
+    } catch (const db_error& error) {
+        CHECK(error.code() == error_code::invalid_page);
+        CHECK(error.context().object_id == fid && error.context().page == 12345);
+        CHECK(error.context().operation == "buffer_pool.fetch_page");
+    }
+    CHECK(bpm.stats().hits == before.hits && bpm.stats().misses == before.misses);
+    CHECK(bpm.stats().evictions == before.evictions && bpm.stats().writebacks == before.writebacks);
+    CHECK(bpm.cached_page_count() == 1);
+    bpm.check_invariants();
+
+    bpm.close_file(fid);
+    CHECK(bpm.cached_page_count() == 0 && bpm.free_frame_count() == 1);
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { fm.get_file(fid); }));
+    CHECK(throws_code(error_code::invalid_file_handle, [&] { bpm.close_file(fid); }));
+    fid = fm.open_file(path.string());
+    CHECK(fm.get_file(fid).get_num_pages() == 2);
+    { auto g = bpm.fetch_page(fid, pid); CHECK(*g.view() == pattern_page(55)); }
+    bpm.close_file(fid);
     bpm.shutdown();
 }
 
@@ -479,6 +527,7 @@ int main()
         test_flush_and_discard(tmp);
         test_file_index_and_close(tmp);
         test_read_and_write_failures(tmp);
+        test_reserved_header_and_close(tmp);
         test_destructor_flush(tmp);
         test_randomized_index_lifecycle(tmp);
     }
@@ -490,6 +539,6 @@ int main()
         std::cerr << failures << " check(s) failed\n";
         return 1;
     }
-    std::cout << "buffer_pool tests passed (9 groups, 500 randomized operations)\n";
+    std::cout << "buffer_pool tests passed (10 groups, 500 randomized operations)\n";
     return 0;
 }

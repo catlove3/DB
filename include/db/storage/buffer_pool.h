@@ -1,5 +1,6 @@
 #pragma once
 #include <db/common/types.h>
+#include <db/common/error.h>
 #include <db/storage/file_manager.h>
 #include <cstddef>
 #include <cstdint>
@@ -198,6 +199,7 @@ public:
     buffer_pool_manager(file_manager & fm_,std::size_t frame_count);
     ~buffer_pool_manager()noexcept;
 
+    // Page 0 belongs exclusively to file_manager and is never cached.
     page_guard fetch_page(file_id fid,page_id pid,access_type access = access_type::read);
     page_guard new_page(file_id fid);
 
@@ -209,6 +211,8 @@ public:
     bool evict_page(file_id fid,page_id pid);
     bool discard_page(file_id fid,page_id pid);
     std::size_t flush_and_invalidate_file(file_id fid);
+    // Preferred close path: reject pinned pages, flush/invalidate, then close.
+    void close_file(file_id fid);
     // Requires all guards released; flushes and resets the pool, keeping stats.
     void shutdown();
 

@@ -1,8 +1,17 @@
 #include "db/common/cli.h"
+#include "db/common/error.h"
 
-#include <stdexcept>
+#include <utility>
 
 namespace db {
+
+namespace {
+db_error cli_error(std::string message) {
+    error_context context;
+    context.operation = "parse_cli";
+    return db_error(error_code::invalid_argument, std::move(message), std::move(context));
+}
+}
 
 CliOptions parse_cli(int argc, char* argv[]) {
     CliOptions options;
@@ -10,7 +19,7 @@ CliOptions parse_cli(int argc, char* argv[]) {
         const std::string argument = argv[i];
         const auto read_value = [&]() -> std::string {
             if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
-                throw std::invalid_argument("missing value for " + argument);
+                throw cli_error("missing value for " + argument);
             }
             return argv[++i];
         };
@@ -30,7 +39,7 @@ CliOptions parse_cli(int argc, char* argv[]) {
         } else if (argument == "-t" || argument == "--table") {
             options.import_table = read_value();
         } else {
-            throw std::invalid_argument("unknown argument: " + argument);
+            throw cli_error("unknown argument: " + argument);
         }
     }
 
@@ -38,17 +47,18 @@ CliOptions parse_cli(int argc, char* argv[]) {
         return options;
     }
     if (options.import_file.empty() != options.import_table.empty()) {
-        throw std::invalid_argument("--file and --table must be supplied together");
+        throw cli_error("--file and --table must be supplied together");
     }
     if (options.initialize && (!options.database.empty() || !options.import_file.empty())) {
-        throw std::invalid_argument("--init cannot be combined with database selection or import");
+        throw cli_error("--init cannot be combined with database selection or import");
     }
     return options;
 }
 
 void print_help(std::ostream& output) {
     output << "Usage: mydb [options]\n"
-              "IDBS C++17 starter; SQL execution and storage are not implemented.\n\n"
+              "IDBS C++17 starter; SQL execution is not implemented.\n"
+              "Storage is not yet connected to the SQL shell.\n\n"
               "  -h, --help              Show this help and exit\n"
               "  -b, --batch             Read one SQL statement per line, without prompts\n"
               "      --init              Exit successfully; no persistent state exists yet\n"
