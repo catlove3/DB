@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "name": "WSL-GCC",
+      "compilerPath": "/usr/bin/g++",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "linux-gcc-x64",
+      "includePath": ["${workspaceFolder}/include"],
+      "compileCommands": ["${workspaceFolder}/build-debug/compile_commands.json"],
+      "browse": {
+        "path": [
+          "${workspaceFolder}/include",
+          "${workspaceFolder}/src",
+          "${workspaceFolder}/tests/unit"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      }
+    }
+  ],
+  "version": 4,
+  "enableConfigurationSquiggles": true
+}

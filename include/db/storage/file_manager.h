@@ -12,6 +12,12 @@
 #include <sys/types.h>   // off_t
 
 namespace db{
+    static constexpr mode_t FILE_MODE = 0644;
+    constexpr uint32_t magic = 0x114514;
+    constexpr uint32_t ver = 1;
+
+
+
     /** @return src 起始的 4 字节小端无符号数。@pre src 指向至少 4 个可读字节；不检查空指针/长度。 */
     uint32_t read_u32(const void * src)noexcept;
     /** @return src 起始的 8 字节小端无符号数。@pre src 指向至少 8 个可读字节；不检查空指针/长度。 */

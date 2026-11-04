@@ -25,7 +25,14 @@ printf 'SHOW DATABASES;\n' | ./build/mydb -b
 
 第二条命令当前返回“SQL execution is not implemented”的错误结果块，说明输入输出入口已经连通。`--init` 目前只直接以 0 退出；`--data_dir` 仅保存路径参数。接入目录和引擎后再补充数据初始化与清理。`-d` 和 `-f`/`-t` 会明确报告功能尚未实现。
 
-Windows/Visual Studio 可直接打开仓库根目录中的 CMake 工程。
+当前使用 VS Code + WSL，在 WSL 终端中执行以下命令打开工程：
+
+```bash
+cd /home/zypca/IDBS
+code .
+```
+
+Windows 端安装微软的 WSL 扩展；打开后左下角应显示 `WSL: ...`。在这个窗口中安装推荐的 C/C++ 和 CMake Tools 扩展，确保它们安装在 WSL 中。按 `Ctrl+Shift+B` 配置并编译 Debug；通过“终端 → 运行任务”选择 `IDBS: 运行` 或 `IDBS: 测试`。
 
 ## 开发资料
 

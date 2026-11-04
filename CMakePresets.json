@@ -9,18 +9,22 @@
     {
       "name": "debug",
       "displayName": "IDBS Debug",
+      "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "BUILD_TESTING": "ON"
       }
     },
     {
       "name": "release",
       "displayName": "IDBS Release",
+      "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "BUILD_TESTING": "ON"
       }
     }

@@ -1,0 +1,19 @@
+{
+  "files.associations": {
+    "*.h": "cpp"
+  },
+  "editor.semanticHighlighting.enabled": true,
+  "C_Cpp.intelliSenseEngine": "default",
+  "C_Cpp.autocomplete": "default",
+  "C_Cpp.enhancedColorization": "enabled",
+  "[cpp]": {
+    "editor.quickSuggestions": {
+      "other": true,
+      "comments": false,
+      "strings": false
+    },
+    "editor.suggestOnTriggerCharacters": true
+  },
+  "cmake.configureOnOpen": true,
+  "cmake.useCMakePresets": "always"
+}

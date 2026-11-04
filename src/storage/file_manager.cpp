@@ -12,9 +12,6 @@ namespace db
 {
 
 static constexpr page empty_page = page();
-static constexpr mode_t FILE_MODE = 0644;
-constexpr uint32_t magic = 0x114514;
-constexpr uint32_t ver = 1;
 constexpr file_header fh(magic,ver,page_size,1);
 constexpr off_t num_pages_offset = sizeof(file_header::magic_number) + sizeof(file_header::version) + sizeof(file_header::page_size);
 

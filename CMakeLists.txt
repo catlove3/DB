@@ -34,12 +34,17 @@ target_include_directories(db_storage PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(db_storage PUBLIC db_common)
 idbs_configure_target(db_storage)
 
+add_library(db_record STATIC src/record/record.cpp)
+target_include_directories(db_record PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(db_record PUBLIC db_storage)
+idbs_configure_target(db_record)
+
 add_executable(mydb src/main.cpp)
 target_link_libraries(mydb PRIVATE db_common db_storage)
 idbs_configure_target(mydb)
 
-# Add record/index/catalog/parser/execution libraries when they have real
-# sources. SQL.g4 is a reference input; the starter does not link ANTLR yet.
+# Add index/catalog/parser/execution libraries when they have real sources.
+# SQL.g4 is a reference input; the starter does not link ANTLR yet.
 include(CTest)
 if(BUILD_TESTING)
     add_executable(unit_file_manager tests/unit/test_file_manager.cpp)
@@ -64,6 +69,12 @@ if(BUILD_TESTING)
     idbs_configure_target(unit_buffer_pool)
     add_test(NAME unit_buffer_pool COMMAND unit_buffer_pool)
     set_tests_properties(unit_buffer_pool PROPERTIES TIMEOUT 30)
+
+    add_executable(unit_record_page tests/unit/test_record_page.cpp)
+    target_link_libraries(unit_record_page PRIVATE db_record)
+    idbs_configure_target(unit_record_page)
+    add_test(NAME unit_record_page COMMAND unit_record_page)
+    set_tests_properties(unit_record_page PROPERTIES TIMEOUT 30)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

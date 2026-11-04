@@ -2,19 +2,36 @@
 /build*/
 /out/
 *.o
+
+# Visual Studio caches and generated compiler files
+.vs/
+ipch/
 *.obj
 *.pdb
-
-# Visual Studio local state; keep the original solution/project files
-.vs/
-*.vcxproj.user
+*.ilk
+*.idb
+*.pch
+*.ipch
 *.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.db-shm
+*.VC.db-wal
+*.VC.opendb
+*.vcxproj.user
+*.tlog
+*.lastbuildstate
+
+# Generated output of the former Visual Studio project
 /数据库大作业/Debug/
 /数据库大作业/Release/
 /数据库大作业/x64/
+/数据库大作业/x86/
 /数据库大作业/数据库大作业/Debug/
 /数据库大作业/数据库大作业/Release/
 /数据库大作业/数据库大作业/x64/
+/数据库大作业/数据库大作业/x86/
 
 # Local development documentation (kept on disk, not versioned)
 /docs/
