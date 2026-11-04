@@ -23,47 +23,50 @@ namespace{
 /*
     CLASS : RECORD PAGE HELPER
     docs:
-        管理一张内存页中的定长记录，只解释和修改 page 字节。
-        不负责文件 I/O、缓存页生命周期、字段解码或跨页空闲链表。
+        Manage fixed-size records within one in-memory page.
+        File I/O, buffer guards, field decoding and free-page links belong to other layers.
 
     layout:
         [64-byte header][occupied bitmap][fixed-size record slots]
-        R = record_size，单位为 byte，合法范围为 1..8127。
-        S = num_slots，取满足 64 + ceil(S/8) + S*R <= page_size 的最大值。
-        B = (S + 7)/8，槽 slot 的记录偏移为 64 + B + slot*R。
-        槽号从 0 开始，位图最低位对应本字节中的第一个槽，1 表示占用。
-        页头整数使用小端编码，magic 为 RMP1，version 为 1。
-        live_count 必须等于有效位图中 1 的数量；保留字节和无效尾位为 0。
-        flags 和 next_free 由文件层维护，页内 CRUD 不修改它们。
+        R = record_size in bytes, valid range: 1..8127.
+        S = largest num_slots satisfying 64 + ceil(S/8) + S*R <= page_size.
+        B = (S + 7)/8; the payload offset of slot is 64 + B + slot*R.
+        Slots start at 0; each bitmap byte maps slots from its lowest bit upward.
+        A set bit means occupied. Header integers use little-endian encoding.
+        The page magic is RMP1 and the format version is 1.
+        live_count equals the number of set bits for valid slots.
+        Reserved header bytes and unused bitmap bits must be zero.
+        The file layer maintains flags and next_free; page CRUD leaves them unchanged.
 
     methods:
-        clear        : 只清零整页；清零后还不是合法记录页。
-        capacity     : 根据记录字节数计算槽容量，非法长度抛 invalid_argument。
-        init         : 先验证长度，再清页并写入合法空页头。
-        validate     : 校验页格式、预期记录长度、容量、位图及计数，不修改页。
-        record_count : 校验后返回当前有效记录数。
-        occupied     : 检查指定槽的占用位，合法空槽返回 false。
-        first_free   : 返回最小空槽号；页满返回 nullopt；槽号 0 是有效结果。
-        read         : 返回目标记录的独立字节副本，不借用页内存。
-        insert       : 写入最小空槽、置占用位并增加计数；页满返回 nullopt。
-        update       : 覆盖原槽载荷，保持槽号、占用位和计数不变。
-        erase        : lazy remove，只清占用位并减少计数。
-                       保留旧载荷，禁止通过 read 读取，复用槽时由 insert 覆盖。
+        clear        : Zero the entire page; the result still needs init to be valid.
+        capacity     : Compute slot capacity; invalid sizes raise invalid_argument.
+        init         : Validate the size, then clear the page and write an empty header.
+        validate     : Check format, expected size, capacity, bitmap and count without writes.
+        record_count : Validate the page and return its live record count.
+        occupied     : Check a slot's occupancy bit; a valid empty slot returns false.
+        first_free   : Return the lowest free slot or nullopt if full; slot 0 is valid.
+        read         : Return an independent byte copy without borrowing page memory.
+        insert       : Fill the lowest free slot, set its bit and increment the count.
+                       Return nullopt if the page is full.
+        update       : Replace the payload without changing the slot, bitmap or count.
+        erase        : Lazy remove: clear the occupancy bit and decrement the count.
+                       Keep the old payload; read rejects it and insert overwrites it on reuse.
 
     helpers:
-        check_page           : 检查页内记录长度，再调用 validate。
-        assess               : 检查槽号范围和期望占用状态。
-        get_offset_and_resid : 计算占用位所在的页内字节偏移和 bit 偏移。
-        get_record_offset    : 计算记录载荷的页内字节偏移。
-        find_free            : 在已验证的页内找空槽，避免重复完整校验。
-        除 check_page 外，以上辅助函数均要求页已经通过格式检查；
-        get_record_offset 还要求槽号合法。
+        check_page           : Check the stored record size, then call validate.
+        assess               : Check the slot range and expected occupancy.
+        get_offset_and_resid : Compute the occupancy byte offset and bit index.
+        get_record_offset    : Compute the record payload's byte offset within the page.
+        find_free            : Find a free slot without repeating full page validation.
+        All helpers except check_page require an already validated page.
+        get_record_offset also requires a valid slot number.
 
     errors:
-        页格式损坏 -> invalid_format；槽号越界 -> invalid_rid。
-        合法空槽上的 read/update/erase -> record_not_found。
-        insert/update 输入长度不等于 R -> invalid_argument。
-        所有拒绝检查在修改页前完成；被拒绝时原页字节不变。
+        Corrupt page format -> invalid_format; out-of-range slot -> invalid_rid.
+        read/update/erase on a valid empty slot -> record_not_found.
+        insert/update with a payload length different from R -> invalid_argument.
+        All rejection checks precede writes; rejected operations leave page bytes unchanged.
 */
 
 void record_page_helper::clear(page & p)
