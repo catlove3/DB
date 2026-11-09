@@ -96,8 +96,29 @@ private:
     std::uint32_t record_size_;
     std::uint32_t slots_per_page_;
 
-    // free_head 和 total_records 每次从元数据页读取，
-    // 不在对象中额外保存可变副本。
+    #pragma pack(push,1)
+    struct meta_data{
+        uint32_t rm;
+        uint32_t v;
+        uint32_t rs;
+        uint32_t ns;
+        uint64_t nfp;
+        uint64_t tr;
+        meta_data(uint32_t _rs,uint32_t _ns,uint64_t _nfp = invalid_page_id,uint64_t _tr = 0);
+    };
+    #pragma pack(pop)
+
+    static void encode(
+        page & p,
+        const meta_data& md
+    ) noexcept;
+
+    meta_data decode(
+        const page & p
+    )const;
+
+    meta_data decode()const;
+
 };
 
 // ---------- 记录扫描 ----------

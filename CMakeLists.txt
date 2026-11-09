@@ -76,6 +76,12 @@ if(BUILD_TESTING)
     add_test(NAME unit_record_page COMMAND unit_record_page)
     set_tests_properties(unit_record_page PROPERTIES TIMEOUT 30)
 
+    add_executable(unit_record_file tests/unit/test_record_file.cpp)
+    target_link_libraries(unit_record_file PRIVATE db_record)
+    idbs_configure_target(unit_record_file)
+    add_test(NAME unit_record_file COMMAND unit_record_file)
+    set_tests_properties(unit_record_file PROPERTIES TIMEOUT 30)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(
