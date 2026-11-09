@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 #include <string>
 #include <variant>
@@ -21,6 +22,18 @@ namespace db {
 	// 缓存池内存槽的编号；对应槽可先后装载不同文件页，不能作为持久地址。
 	typedef std::uint32_t frame_id;
 	typedef std::uint32_t slot_id;
+	// Persistent catalog IDs start at 1; 0 means unassigned, unlike runtime file_id.
+	typedef std::uint64_t database_id;
+	typedef std::uint64_t table_id;
+	typedef std::uint64_t index_id;
+	typedef std::uint64_t constraint_id;
+	typedef std::uint32_t column_id;
+	constexpr database_id invalid_database_id = 0;
+	constexpr table_id invalid_table_id = 0;
+	constexpr index_id invalid_index_id = 0;
+	constexpr constraint_id invalid_constraint_id = 0;
+	constexpr column_id invalid_column_id = 0;
+
 	constexpr page_id invalid_page_id = std::numeric_limits<page_id>::max();
 	constexpr slot_id invalid_slot_id = std::numeric_limits<slot_id>::max();
 	// page 0 属于文件管理器；记录元数据占 page 1，记录数据从 page 2 开始。
@@ -60,6 +73,23 @@ namespace db {
 		INT,
 		FLOAT,
 		VARCHAR
+	};
+
+	// Shared operation progress; callers keep this object even when a service throws.
+	enum class statement_phase
+	{
+		preparing,
+		applying_row,
+		between_rows,
+		metadata_published
+	};
+
+	struct statement_context
+	{
+		statement_phase phase = statement_phase::preparing;
+		std::uint64_t completed_rows = 0;
+		std::optional<std::string> input_path;
+		std::optional<std::size_t> input_line;
 	};
 
 }

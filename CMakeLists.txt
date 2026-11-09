@@ -39,11 +39,16 @@ target_include_directories(db_record PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(db_record PUBLIC db_storage)
 idbs_configure_target(db_record)
 
+add_library(db_catalog STATIC src/catalog/catalog.cpp)
+target_include_directories(db_catalog PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(db_catalog PUBLIC db_record)
+idbs_configure_target(db_catalog)
+
 add_executable(mydb src/main.cpp)
 target_link_libraries(mydb PRIVATE db_common db_storage)
 idbs_configure_target(mydb)
 
-# Add index/catalog/parser/execution libraries when they have real sources.
+# Add index/parser/execution libraries when they have real sources.
 # SQL.g4 is a reference input; the starter does not link ANTLR yet.
 include(CTest)
 if(BUILD_TESTING)
