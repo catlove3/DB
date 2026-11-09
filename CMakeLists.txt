@@ -82,6 +82,12 @@ if(BUILD_TESTING)
     add_test(NAME unit_record_file COMMAND unit_record_file)
     set_tests_properties(unit_record_file PROPERTIES TIMEOUT 30)
 
+    add_executable(unit_row_codec tests/unit/test_row_codec.cpp)
+    target_link_libraries(unit_row_codec PRIVATE db_record)
+    idbs_configure_target(unit_row_codec)
+    add_test(NAME unit_row_codec COMMAND unit_row_codec)
+    set_tests_properties(unit_row_codec PROPERTIES TIMEOUT 30)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(

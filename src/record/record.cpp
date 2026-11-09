@@ -1,8 +1,11 @@
 #include <db/record/record.h>
 #include <db/storage/file_manager.h>
 #include <db/storage/buffer_pool.h>
+#include <climits>
+#include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace db
 {
@@ -385,14 +388,73 @@ void record_page_helper::erase(page& p, slot_id slot)
 
 
 /*
-CLASS : RECORD FILE
-docs:
-    Bind an open file to its fixed-size records without owning its lifetime.
-    Page 1 stores RMF1 metadata; record data pages start at page 2.
-    Read the free-page head and total count from metadata on each operation.
-    Insert pins metadata before changing data and removes a full head page from the free list.
-    Get and update preserve record positions and counts.
-    Erase uses lazy remove, decrements the total count and links a formerly full page once.
+    CLASS : RECORD FILE
+    docs:
+        Manage fixed-size records across the data pages of one open file.
+        Borrow fm, bpm and fid; the caller owns the managers and closes the file through bpm.
+        The file must stay open and both managers must outlive this object.
+        Use one active record_file per physical file; copying and moving are disabled.
+        Cache only record_size_ and slots_per_page_; read mutable metadata from page 1.
+        Keep guards local to each operation and return independent record byte copies.
+        Field encoding, SQL execution and index maintenance belong to other layers.
+
+    layout:
+        page 0       : File header owned by file_manager; never accessed through bpm here.
+        page 1       : RMF1 metadata, version 1, with little-endian integer fields.
+        page 2..N-1  : RMP1 data pages managed by record_page_helper; N is the file page count.
+        Metadata offsets and meta_data fields:
+            0  : rm  -> uint32_t magic, RMF1 (0x31464d52).
+            4  : v   -> uint32_t format version, 1.
+            8  : rs  -> uint32_t record size R in bytes, valid range: 1..8127.
+            12 : ns  -> uint32_t slots per data page S, equal to capacity(R).
+            16 : nfp -> uint64_t free-page list head, or invalid_page_id for an empty list.
+            24 : tr  -> uint64_t total live record count across all data pages.
+        Bytes [32,page_size) are reserved and must be zero.
+        A RID contains the data page number and slot number; it is relative to this file.
+        Erased slots may be reused, so an old RID can later refer to a different record.
+        nfp points to the first non-full page; each data page stores its own next_free link.
+        Linked pages have flags bit 0 set; full pages are outside the free-page list.
+        Insert uses the list head and removes it when full; a new non-full page becomes the head.
+        Erase adds a page at the head only when that page was full before deletion.
+        An initialized empty file has two pages; data pages are allocated on demand.
+
+    methods:
+        initialize   : Require a valid R, at least two buffer frames and a file with only page 0.
+                       Append page 1 with nfp = invalid_page_id and tr = 0; do not allocate data pages.
+        record_file  : Bind an initialized file, validate its metadata and cache R and S.
+                       Require at least two buffer frames; do not scan all data pages or links.
+        record_size  : Return cached R without fetching a page.
+        record_count : Read and validate page 1, then return tr; no mutable count is cached.
+        insert       : Require R bytes; use the free-list head or allocate and initialize a data page.
+                       Insert into its lowest free slot, maintain the free list, increment tr and return RID.
+        get          : Check the RID page and expected page format, then return a record byte copy.
+        update       : Require R bytes and overwrite an occupied slot in place.
+                       Preserve RID, occupancy, page and file counts, and free-page links.
+        erase        : Lazy remove: clear occupancy without clearing or relocating the payload.
+                       Decrement tr and link a formerly full page once; retain empty data pages.
+        scan         : Return a cursor borrowing this object and traversing all data pages.
+                       Keep the file alive and unchanged for the lifetime of an active scan.
+
+    helpers:
+        meta_data    : Hold decoded metadata values; nfp and tr are local copies, not persistent members.
+        encode       : Write the six fields into a writable page without allocation or I/O.
+                       Preserve reserved bytes; initialization clears the page before encoding.
+        decode(page) : Validate magic, version, R/S, free-head bounds, count bounds and reserved bytes.
+                       Return decoded fields; do not verify the entire chain or sum all page counts.
+        decode()     : Fetch metadata through bpm, decode it and verify cached R/S still match.
+        Insert and erase pin metadata and the target data page before modifying existing records.
+        Guard get() marks modified cache pages dirty; writes are flushed by bpm later.
+        Releasing a guard only unpins the page; it does not flush or close the file.
+
+    errors:
+        Invalid R, insufficient configured frames or repeated initialization -> invalid_argument.
+        Unregistered file ID -> invalid_file_handle; malformed metadata, pages or links -> invalid_format.
+        RID page outside [2,N) or slot outside [0,S) -> invalid_rid.
+        get/update/erase on a valid empty slot -> record_not_found.
+        insert/update with a payload length different from R -> invalid_argument.
+        Exhausted total-record counter -> resource_limit; unavailable buffer frames -> buffer_exhausted.
+        Input, format and required-page fetch checks precede changes to existing records and metadata.
+        Allocation, I/O and memory failures propagate; appended pages and partial disk writes are not rolled back.
 */
 
 record_file::meta_data::meta_data(uint32_t _rs,uint32_t _ns,uint64_t _nfp,uint64_t _tr)
@@ -756,6 +818,485 @@ void record_file::erase(rid id)
     --md.tr;
     encode(*meta_guard.get(),md);
 }
+
+
+record_scan record_file::scan() const
+{
+    return record_scan(*this);
+}
+
+
+/*
+
+
+
+
+
+
+
+
+
+*/
+
+
+
+record_scan::record_scan(const record_file& file):file_(&file)
+{
+    file_handle & fh = file.fm_.get_file(file.fid_);
+    end_page_ = fh.get_num_pages();
+
+}
+
+
+
+record_scan::record_scan(record_scan&& other) noexcept
+{
+    this->end_page_ = other.end_page_;
+    this->file_ = other.file_;
+    this->next_page_ = other.next_page_;
+    this->next_slot_ = other.next_slot_;
+    this->state_ = other.state_;
+
+    other.file_ = nullptr;
+    other.next_page_ = first_record_data_page;
+    other.next_slot_ = 0;
+    other.state_ = scan_state::moved;
+}
+
+
+
+
+
+std::optional<scan_item> record_scan::next()
+{
+    if(state_ == scan_state::exhausted)
+        return std::nullopt;
+
+    if(state_ != scan_state::active)
+        throw db_error(
+            error_code::invalid_argument,
+            "scan is failed or moved"
+        );
+
+    try
+    {
+        while(next_page_ < end_page_)
+        {
+            page_guard guard = file_->bpm_.fetch_page(file_->fid_,next_page_);
+            const page & p = *guard.view();
+            record_page_helper::validate(p,file_->record_size_);
+
+            while(next_slot_ < file_->slots_per_page_)
+            {
+                const slot_id slot = next_slot_;
+                uint8_t bytes = (uint8_t)p[header_bytes + slot / 8];
+                uint8_t residual = slot % 8;
+                if((bytes & (1 << residual)) == 0)
+                {
+                    ++next_slot_;
+                    continue;
+                }
+                scan_item item;
+                item.id.pid = next_page_;
+                item.id.sid = next_slot_;
+                item.bytes = record_page_helper::read(p,slot);
+
+                ++next_slot_;
+                return item;
+            }
+
+            ++next_page_;
+            next_slot_ = 0;
+
+        }
+        state_ = scan_state::exhausted;
+        return std::nullopt;
+    }
+    catch(...)
+    {
+        state_ = scan_state::failed;
+        throw;
+    }
+}
+
+
+/*
+    CLASS : ROW CODEC
+    docs:
+        Convert typed rows to fixed-size record bytes and back using an owned column schema.
+        columns_ stores types, VARCHAR limits and nullability; offsets_ stores payload positions.
+        The constructor computes record_size_ once; encode and decode do not access files or bpm.
+
+    layout:
+        [NULL bitmap][column 0 payload][column 1 payload]...
+        Each column uses one NULL bit; bit 1 means NULL and bit 0 means a stored value.
+        The bitmap occupies ceil(column_count/8) bytes; unused tail bits must be zero.
+        INT occupies 4 bytes, FLOAT uses 8-byte IEEE 754 binary64, VARCHAR(n) occupies 2+n bytes.
+        Integers and floating-point bit patterns use little-endian encoding.
+        VARCHAR starts with a little-endian uint16 length followed by that many raw bytes.
+        String lengths are measured in bytes; embedded zero bytes are allowed.
+        NULL payloads and unused VARCHAR padding are zero; every row still occupies record_size_ bytes.
+        This NULL bitmap is separate from the record page's slot occupancy bitmap.
+
+    methods:
+        row_codec   : Validate column definitions and compute bounded payload offsets and row size.
+        record_size : Return the encoded size in bytes, excluding record page headers and slot bitmaps.
+        encode      : Validate the complete row, allocate zeroed bytes, then encode each value.
+                      NULL skips payload encoding; numeric values are not implicitly converted.
+        decode      : Validate length, NULL bits, payloads, string bounds, padding and finite floats.
+                      Return owned values and strings; preserve empty strings, NULL and signed zero.
+
+    errors:
+        Empty schema, invalid type/length declaration or wrong value count -> invalid_argument.
+        A row wider than the record page limit -> value_out_of_range.
+        Wrong variant alternative -> type_mismatch; disallowed input NULL -> not_null_violation.
+        Oversized input strings or non-finite input floats -> value_out_of_range.
+        Malformed encoded bytes, including illegal stored NULL -> invalid_format.
+        Unsupported byte or double representation -> feature_unsupported during construction.
+        Inputs are never modified; allocation failures propagate without publishing partial results.
+*/
+
+
+
+row_codec::row_codec(std::vector<column_spec> columns):columns_(columns)
+{
+    if(CHAR_BIT != 8 || sizeof(double) != 8 ||
+        !std::numeric_limits<double>::is_iec559 ||
+        std::numeric_limits<double>::digits != 53 ||
+        std::numeric_limits<double>::max_exponent != 1024)
+        throw db_error(
+            error_code::feature_unsupported,
+            "row encoding requires 8-bit bytes and IEEE 754 binary64"
+        );
+
+    if(columns.size() == 0)
+        throw db_error(
+            error_code::invalid_argument,
+            "column list must not be empty"
+        );
+
+    std::size_t bitmap_bytes = (columns.size()+7) / 8;
+    if(bitmap_bytes > max_record_size)
+        throw db_error(
+            error_code::value_out_of_range,
+            "null bitmap exceeds record size limit"
+        );
+
+    offsets_.reserve(columns.size());
+    record_size_ = static_cast<std::uint32_t>(bitmap_bytes);
+    for(std::size_t i = 0;i < columns.size();++i)
+    {
+        data_type type = columns[i].type;
+        uint32_t to_increase = 0;
+
+        if(type == data_type::INT || type == data_type::FLOAT)
+        {
+            if(columns[i].max_length != 0)
+                throw db_error(
+                    error_code::invalid_argument,
+                    "numeric columns max_lengths must be zero"
+                );
+
+            to_increase = (type == data_type::INT)?4:8;
+        }
+        else if(type == data_type::VARCHAR)
+        {
+            if(columns[i].max_length == 0 || columns[i].max_length > 65535)
+                throw db_error(
+                    error_code::invalid_argument,
+                    "varchar max_length must be within 1..65535"
+                );
+            to_increase = columns[i].max_length + 2;
+        }
+        else
+            throw db_error(
+                error_code::invalid_argument,
+                "invalid column type"
+            );
+
+        if(to_increase > max_record_size - record_size_)
+            throw db_error(
+                error_code::value_out_of_range,
+                "record does not fit in a page"
+            );
+
+        offsets_.push_back(record_size_);
+        record_size_ += to_increase;
+    }
+
+}
+
+
+std::uint32_t row_codec::record_size() const noexcept
+{
+    return record_size_;
+}
+
+
+
+record_bytes row_codec::encode(const row& values) const
+{
+    if(values.size() != columns_.size())
+        throw db_error(
+            error_code::invalid_argument,
+            "value count does not match column count"
+        );
+
+
+    for(std::size_t i = 0;i < values.size();++i)
+    {
+        const value& val = values[i];
+        const column_spec & col = columns_[i];
+        if(std::holds_alternative<std::monostate>(val))
+        {
+            if(!col.nullable)
+                throw db_error(
+                    error_code::not_null_violation,
+                    "require not null value"
+                );
+            continue;
+        }
+        bool correct_type = (col.type == data_type::INT && std::holds_alternative<std::int32_t>(val))   ||
+                            (col.type == data_type::FLOAT && std::holds_alternative<double>(val))       ||
+                            (col.type == data_type::VARCHAR && std::holds_alternative<std::string>(val));
+        if(!correct_type)
+            throw db_error(
+                error_code::type_mismatch,
+                "value type does not match column type"
+            );
+        if(col.type == data_type::FLOAT && !std::isfinite(std::get<double>(val)))
+            throw db_error(
+                error_code::value_out_of_range,
+                "float value must be finite"
+            );
+        if(col.type == data_type::VARCHAR &&
+            std::get<std::string>(val).size() > col.max_length)
+            throw db_error(
+                error_code::value_out_of_range,
+                "string exceeds column maximum length"
+            );
+    }
+
+    record_bytes ret(this->record_size_,std::byte{0});
+
+    for(std::size_t i = 0;i < values.size();++i)
+    {
+        const value& val = values[i];
+        const column_spec & col = columns_[i];
+        if(std::holds_alternative<std::monostate>(val))
+        {
+            std::size_t bytes = i / 8;
+            std::size_t resid = i % 8;
+            ret[bytes] |= ((std::byte)1 << resid);
+            continue;
+        }
+
+        std::byte * dest = ret.data() + offsets_[i];
+        data_type type = col.type;
+
+        switch(type)
+        {
+        case data_type::INT:
+        {
+            std::int32_t num = std::get<std::int32_t>(val);
+            write_u32(dest,static_cast<std::uint32_t>(num));
+        };break;
+        case data_type::FLOAT:
+        {
+            double num = std::get<double>(val);
+            uint64_t bits = 0;
+            std::memcpy(&bits,&num,sizeof(bits));
+            write_u64(dest,bits);
+        };break;
+        case data_type::VARCHAR:
+        {
+            const std::string& text = std::get<std::string>(val);
+            std::uint16_t len = static_cast<std::uint16_t>(text.size());
+            dest[0] = (std::byte)(len & 0xffu);
+            dest[1] = (std::byte)((len >> 8) & 0xffu);
+            if(!text.empty())
+                std::memcpy(dest + 2,text.data(),text.size());
+        };break;
+        default: throw db_error(
+            error_code::internal_error,
+            "unexpected type occurred while encoding"
+        );
+        }
+
+
+    }
+
+    return ret;
+
+
+}
+
+
+
+
+
+row row_codec::decode(const record_bytes& bytes) const
+{
+    if(bytes.size() != record_size_)
+        throw db_error(
+            error_code::invalid_format,
+            "mismatch of expected format of row and what passed in"
+        );
+    const std::size_t bitmap_bytes = (columns_.size()+7) / 8;
+    const std::size_t used_bits = columns_.size() % 8;
+    if(used_bits != 0 &&
+        (std::to_integer<unsigned>(bytes[bitmap_bytes-1]) >> used_bits) != 0)
+        throw db_error(
+            error_code::invalid_format,
+            "nonzero unused null bitmap bits"
+        );
+
+    row ret(columns_.size());
+
+
+    for(std::size_t i = 0;i < columns_.size();++i)
+    {
+        const db::column_spec & col = columns_[i];
+        data_type type = col.type;
+        std::uint64_t byte = i / 8;
+        std::uint64_t resid = i % 8;
+        std::byte mask = (bytes[byte] & (std::byte)(1 << resid));
+        if(mask != (std::byte)(0))
+        {
+            if(!col.nullable)
+                throw db_error(
+                    error_code::invalid_format,
+                    "null found in a non-nullable column"
+                );
+            const std::size_t end = i + 1 < columns_.size() ? offsets_[i+1] : record_size_;
+            for(std::size_t j = offsets_[i];j < end;++j)
+                if(bytes[j] != std::byte{0})
+                    throw db_error(
+                        error_code::invalid_format,
+                        "nonzero payload in a null column"
+                    );
+            ret[i] = std::monostate{};
+            continue;
+        }
+
+        switch(type)
+        {
+        case data_type::INT:
+        {
+            uint32_t bits = read_u32(bytes.data() + offsets_[i]);
+            std::int64_t num = bits <= 0x7fffffffu
+                ? static_cast<std::int64_t>(bits)
+                : static_cast<std::int64_t>(bits) - (std::int64_t{1} << 32);
+            ret[i] = static_cast<std::int32_t>(num);
+        };break;
+        case data_type::FLOAT:
+        {
+            uint64_t bits = read_u64(bytes.data() + offsets_[i]);
+            double num = 0;
+            std::memcpy(&num,&bits,sizeof(num));
+            if(!std::isfinite(num))
+                throw db_error(
+                    error_code::invalid_format,
+                    "non-finite float in stored record"
+                );
+            ret[i] = num;
+        };break;
+        case data_type::VARCHAR:
+        {
+            uint16_t lower,upper;
+            lower = uint16_t(bytes[offsets_[i]]);
+            upper = uint16_t(bytes[offsets_[i] + 1]) << 8;
+            uint16_t len = lower | upper;
+            if(len > col.max_length)
+                throw db_error(
+                    error_code::invalid_format,
+                    "stored string exceeds column maximum length"
+                );
+            for(std::size_t j = len;j < col.max_length;++j)
+                if(bytes[offsets_[i]+2+j] != std::byte{0})
+                    throw db_error(
+                        error_code::invalid_format,
+                        "nonzero varchar padding in stored record"
+                    );
+            std::string text;
+            text.resize(len);
+            if(len != 0)
+                std::memcpy(text.data(),bytes.data()+offsets_[i]+2,len);
+            ret[i] = std::move(text);
+
+        };break;
+        default: throw db_error(
+            error_code::internal_error,
+            "unexpected type occured while decoding"
+        );
+        }
+
+    }
+
+
+    return ret;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
