@@ -39,9 +39,16 @@ target_include_directories(db_record PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(db_record PUBLIC db_storage)
 idbs_configure_target(db_record)
 
+# Vendored nlohmann/json 3.12.0; configure and build never download dependencies.
+add_library(nlohmann_json INTERFACE)
+add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+target_include_directories(nlohmann_json SYSTEM INTERFACE
+    "${PROJECT_SOURCE_DIR}/third_party/nlohmann_json/include"
+)
+
 add_library(db_catalog STATIC src/catalog/catalog.cpp)
 target_include_directories(db_catalog PUBLIC "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(db_catalog PUBLIC db_record)
+target_link_libraries(db_catalog PUBLIC db_record PRIVATE nlohmann_json::nlohmann_json)
 idbs_configure_target(db_catalog)
 
 add_executable(mydb src/main.cpp)
@@ -92,6 +99,17 @@ if(BUILD_TESTING)
     idbs_configure_target(unit_row_codec)
     add_test(NAME unit_row_codec COMMAND unit_row_codec)
     set_tests_properties(unit_row_codec PROPERTIES TIMEOUT 30)
+
+    add_executable(unit_catalog tests/unit/test_catalog.cpp)
+    target_link_libraries(unit_catalog PRIVATE db_catalog nlohmann_json::nlohmann_json)
+    idbs_configure_target(unit_catalog)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(unit_catalog PRIVATE IDBS_CATALOG_FAILURE_TESTS)
+        target_link_options(unit_catalog PRIVATE
+            -Wl,--wrap=pwrite -Wl,--wrap=close -Wl,--wrap=rename)
+    endif()
+    add_test(NAME unit_catalog COMMAND unit_catalog)
+    set_tests_properties(unit_catalog PROPERTIES TIMEOUT 30)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

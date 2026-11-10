@@ -16,6 +16,13 @@ class database_manager;
 class ddl_service;
 
 constexpr std::uint32_t catalog_format_version = 1;
+constexpr int json_indent = 4;
+inline const std::filesystem::path data_dir = std::filesystem::path(__FILE__)
+                                                .parent_path()
+                                                .parent_path()
+                                                .parent_path()
+                                                .parent_path() / "data";
+inline const std::filesystem::path db_dir = data_dir / "databases";
 
 // ---------- Persistent schema snapshots ----------
 
@@ -158,69 +165,21 @@ struct create_table_request
     std::vector<foreign_key_definition> foreign_keys;
 };
 
-/*
-    CLASS : CATALOG STORE
-    docs:
-        Own the data-root path and persist catalog value snapshots as JSON.
-        JSON types and serialization helpers stay private to catalog.cpp.
-        All methods below are declarations; persistence is not implemented yet.
-
-    layout:
-        <root>/engine.meta.json                      -> root_catalog
-        <root>/databases/<database_id>/catalog.json  -> database_catalog
-        <root>/databases/<database_id>/tables/<table_id>.heap
-        <root>/databases/<database_id>/indexes/<index_id>.bpt
-        Schemas contain persistent IDs and relative paths, never runtime file_id values.
-
-    methods:
-        initialize    : Create a fresh empty catalog; reject an existing root catalog.
-        load_root     : Read and validate an independent root snapshot.
-        load_database : Require a registered ID; validate schema, paths and referenced files.
-        save_root     : Prepare JSON, write and close a temporary file, then replace the root file.
-        save_database : Publish a complete database snapshot using the same replacement protocol.
-        data_root     : Return the owned root path by reference; do not perform I/O.
-
-    errors:
-        Missing initial catalog -> object_not_found; malformed registered data -> invalid_format.
-        Actual filesystem errors -> io_error; allocation failures propagate.
-        The caller serializes catalog writes. Successful replacement must return without later throws.
-*/
 class catalog_store
 {
+private:
+    std::filesystem::path data_lord;
 public:
-    explicit catalog_store(std::filesystem::path data_root);
+    explicit catalog_store(std::filesystem::path data_root = data_dir);
 
-    void initialize();
+    void init_meta();
     root_catalog load_root() const;
     database_catalog load_database(database_id id) const;
     void save_root(const root_catalog& snapshot);
     void save_database(const database_catalog& snapshot);
     const std::filesystem::path& data_root() const noexcept;
-
-private:
-    std::filesystem::path data_root_;
 };
 
-/*
-    CLASS : TABLE LEASE
-    docs:
-        Borrow one registered open table from database_manager.
-        The manager owns schema, codec and records; it must outlive all leases.
-        Moving transfers one borrow; release and destruction only reduce the borrow count.
-        Active leases block DROP, database switching and explicit closure of the table.
-        These lifetime rules are the implementation contract; methods are not implemented yet.
-
-    methods:
-        records : Access the record_file used for CRUD and scans.
-        codec   : Access the row codec built from the effective column definitions.
-        schema  : Access the complete table definition while the lease remains valid.
-        valid   : Report whether this lease still owns a borrow.
-        release : Give up the borrow without closing files; repeated release is harmless.
-
-    errors:
-        Access through a released or moved lease -> invalid_argument.
-        Accessor references cannot outlive the lease; the manager closes files explicitly.
-*/
 class table_lease
 {
 public:
@@ -245,33 +204,6 @@ private:
     table_id table_ = invalid_table_id;
 };
 
-/*
-    CLASS : DATABASE MANAGER
-    docs:
-        Coordinate catalog publication, the current database and open heap registrations.
-        Borrow the store and both storage managers; all three must outlive this object.
-        Reuse one open-table registration per table and keep its address stable for leases.
-        This is an interface scaffold; database and table operations are not implemented yet.
-
-    methods:
-        create_database : Prepare a new ID-based directory and publish the root; do not select it.
-        use_database    : Prepare the target, reject active leases, close old tables and switch.
-        list_databases  : Return ID/name snapshots sorted by name, then ID; no selection required.
-        create_table    : Validate columns/defaults, initialize and close the heap, then publish schema.
-        describe_table  : Return a complete table-schema copy for the current database.
-        list_tables     : Return current-database ID/name snapshots in stable order.
-        open_table      : Reuse or prepare records and codec, check equal row sizes, return a lease.
-        drop_table      : Check references/leases, close resources, publish removal, then reclaim files.
-        drop_database   : Apply the same ordering; clear selection when dropping the current database.
-        current_database: Return the selected persistent ID, or nullopt when no database is selected.
-        close           : Close registered heaps through bpm; reject outstanding leases.
-
-    errors:
-        Missing selection -> no_database; duplicate/missing names or IDs -> object_exists/object_not_found.
-        Active leases -> resource_busy; unsupported index/constraint definitions -> feature_unsupported.
-        Mutating methods receive caller-owned statement_context and mark metadata_published after publication.
-        Publication and cleanup are separate phases; a cleanup error cannot undo a published catalog.
-*/
 class database_manager
 {
 public:
