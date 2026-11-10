@@ -3,7 +3,7 @@
 #include <db/common/types.h>
 #include <db/record/record.h>
 #include <filesystem>
-#include <map>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 
@@ -182,6 +182,13 @@ public:
 
 class table_lease
 {
+private:
+    friend class database_manager;
+    // Adopt a borrow already counted by database_manager::open_table.
+    table_lease(database_manager& manager,table_id id) noexcept;
+
+    database_manager* manager_ = nullptr;
+    table_id table_ = invalid_table_id;
 public:
     ~table_lease() noexcept;
     table_lease(const table_lease&) = delete;
@@ -195,17 +202,28 @@ public:
     bool valid() const noexcept;
     void release() noexcept;
 
-private:
-    friend class database_manager;
-    // Adopt a borrow already counted by database_manager::open_table.
-    table_lease(database_manager& manager,table_id id) noexcept;
-
-    database_manager* manager_ = nullptr;
-    table_id table_ = invalid_table_id;
 };
 
 class database_manager
 {
+private:
+    friend class table_lease;
+    friend class ddl_service;
+    struct opened_table;
+
+    database_catalog& require_database();
+    const database_catalog& require_database() const;
+    opened_table& require_open_table(table_id id);
+    const opened_table& require_open_table(table_id id) const;
+    void release_table(table_id id) noexcept;
+    void close_table(table_id id);
+
+    catalog_store& store_;
+    file_manager& fm_;
+    buffer_pool_manager& bpm_;
+    root_catalog root_;
+    std::optional<database_catalog> current_;
+    std::unordered_map<table_id,std::unique_ptr<opened_table>> open_tables_;
 public:
     database_manager(catalog_store& store,file_manager& fm,buffer_pool_manager& bpm);
     // Explicit close reports errors; destruction performs best-effort cleanup only.
@@ -228,24 +246,6 @@ public:
     table_lease open_table(table_id id);
     void close();
 
-private:
-    friend class table_lease;
-    friend class ddl_service;
-    struct opened_table;
-
-    database_catalog& require_database();
-    const database_catalog& require_database() const;
-    opened_table& require_open_table(table_id id);
-    const opened_table& require_open_table(table_id id) const;
-    void release_table(table_id id) noexcept;
-    void close_table(table_id id);
-
-    catalog_store& store_;
-    file_manager& fm_;
-    buffer_pool_manager& bpm_;
-    root_catalog root_;
-    std::optional<database_catalog> current_;
-    std::map<table_id,std::unique_ptr<opened_table>> open_tables_;
 };
 
 }

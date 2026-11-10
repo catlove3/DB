@@ -6,8 +6,7 @@
 namespace db {
 
 namespace {
-// 构造拥有 message 副本/移动值、operation=parse_cli 的 invalid_argument 异常；
-// 本函数只返回异常对象，由调用方 throw。构造分配失败向上传递，不修改 CLI 状态。
+// Return an owning invalid_argument diagnostic; the caller throws it.
 db_error cli_error(std::string message) {
     error_context context;
     context.operation = "parse_cli";
@@ -15,13 +14,34 @@ db_error cli_error(std::string message) {
 }
 }
 
+/*
+    STRUCT : CLI OPTIONS
+    docs:
+        Keep process arguments separate from engine/catalog interfaces; own all option strings.
+        parse_cli reads borrowed NUL-terminated argv entries starting at argv[1].
+        It only returns configuration: no database opening, directory creation or file import.
+
+    fields:
+        help/batch/initialize : Boolean switches, initially false.
+        data_directory        : Storage path text, initially "./data"; unused by the current shell.
+        database              : Requested database name, initially empty.
+        import_file/table     : Paired import source and destination names, initially empty.
+
+    functions:
+        parse_cli : Parse arguments, with the last occurrence winning for value options.
+                    --help skips final combination checks, but not unknown options or missing values.
+
+    errors:
+        Unknown options, missing/empty values, values starting with '-', unpaired --file/--table,
+        or --init combined with database/import -> invalid_argument with operation=parse_cli.
+        Paths, SQL and database-name existence are not validated. argv and persistent state are unchanged.
+        String allocation failures propagate; no partially filled options are returned.
+*/
 CliOptions parse_cli(int argc, char* argv[]) {
     CliOptions options;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
-        // 借用当前 i/argc/argv/argument，读取紧随选项的非空且非 '-' 开头的值。
-        // 缺值抛 invalid_argument 且不递增 i；成功先递增 i，再返回拥有内容的字符串。
-        // 字符串分配失败时局部 i 可能已递增，但 parse_cli 整体退出，不发布半成品选项。
+        // Validate before advancing i; return an owning copy of the following argument.
         const auto read_value = [&]() -> std::string {
             if (i + 1 >= argc || argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
                 throw cli_error("missing value for " + argument);
@@ -60,6 +80,16 @@ CliOptions parse_cli(int argc, char* argv[]) {
     return options;
 }
 
+/*
+    FUNCTION : PRINT HELP
+    docs:
+        Write usage for the currently supported shell to a borrowed output stream.
+        Do not close or explicitly flush the stream; it must outlive the call.
+
+    errors:
+        Stream failures follow output.exceptions(): set flags or throw ios_base::failure.
+        Already written output is not rolled back after a failure.
+*/
 void print_help(std::ostream& output) {
     output << "Usage: mydb [options]\n"
               "IDBS C++17 starter; SQL execution is not implemented.\n"

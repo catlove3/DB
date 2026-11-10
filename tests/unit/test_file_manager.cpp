@@ -325,6 +325,36 @@ void test_hardlink_identity(temp_dir& tmp)
     fm.remove_file(original.string());
 }
 
+void test_many_file_identities(temp_dir& tmp)
+{
+    file_manager fm;
+    std::vector<file_id> ids;
+    std::vector<file_handle*> handles;
+    std::vector<fs::path> paths;
+    for(int i = 0;i < 64;++i)
+    {
+        paths.push_back(tmp.path / ("identity_" + std::to_string(i) + ".db"));
+        fm.create_file(paths.back().string());
+        ids.push_back(fm.open_file(paths.back().string()));
+        handles.push_back(&fm.get_file(ids.back()));
+    }
+    for(std::size_t i = 0;i < ids.size();++i)
+    {
+        // Growing the registries must not move borrowed handles or lose physical identity checks.
+        CHECK(&fm.get_file(ids[i]) == handles[i]);
+        fs::path alias = tmp.path / ("identity_alias_" + std::to_string(i) + ".db");
+        fs::create_hard_link(paths[i],alias);
+        CHECK(throws(error_code::resource_busy,[&]{fm.open_file(alias.string());}));
+        CHECK(throws(error_code::resource_busy,[&]{fm.remove_file(alias.string());}));
+        fm.close_file(ids[i]);
+        const file_id reopened = fm.open_file(alias.string());
+        CHECK(reopened != ids[i]);
+        fm.close_file(reopened);
+        fm.remove_file(alias.string());
+        fm.remove_file(paths[i].string());
+    }
+}
+
 void test_error_categories(temp_dir& tmp)
 {
     file_manager fm;
@@ -353,6 +383,7 @@ int main()
         test_truncated_file(tmp);
         test_short_file(tmp);
         test_hardlink_identity(tmp);
+        test_many_file_identities(tmp);
         test_error_categories(tmp);
     }
     catch(const std::exception& e) {

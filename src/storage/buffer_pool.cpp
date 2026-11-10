@@ -9,11 +9,21 @@ namespace db
 
 namespace {
 
-/**
- * 构造缓存层 db_error 值，复制 message/operation，按值记录可选 fid/pid。
- * 两个字符串指针必须有效；本函数不验证对象或页、不 throw 返回的异常，交给调用方抛出。
- * 构造分配失败向上传递；不改变缓存、统计计数或文件状态。
- */
+/*
+    HELPERS : BUFFER POOL VALIDATION
+    docs:
+        Validate arguments or construct owning diagnostics before changing cache state.
+
+    methods:
+        pool_error          : Return an error value with copied message/operation and optional file/page IDs.
+                              The caller throws it; valid string pointers are required.
+        require_data_page   : Reject page 0 with invalid_page; leave other page/file checks to the caller.
+        checked_frame_count : Require a count in [1,invalid_frame_id], then return it before allocation.
+
+    errors:
+        Invalid capacity -> invalid_argument. Error construction can propagate allocation failures.
+        These helpers do not access files, update counters or mutate existing cache state.
+*/
 db_error pool_error(error_code code, const char* message, const char* operation,
                     std::optional<file_id> fid = {}, std::optional<page_id> pid = {})
 {
@@ -24,9 +34,6 @@ db_error pool_error(error_code code, const char* message, const char* operation,
     return db_error(code, message, std::move(context));
 }
 
-// 在任何缓存操作前拒绝 pid=0，抛带 fid/pid 的 invalid_page；错误构造可分配失败。
-// 其他 pid 直接放行，不验证 fid 是否打开或 pid 是否在文件内；调用方随后负责这些检查。
-// operation 必须为有效 C 字符串；本函数不修改缓存、统计或磁盘。
 void require_data_page(file_id fid, page_id pid, const char* operation)
 {
     if (pid == 0)
@@ -34,9 +41,6 @@ void require_data_page(file_id fid, page_id pid, const char* operation)
                          "file header page cannot be cached", operation, fid, pid);
 }
 
-// 构造容器前验证帧数在 [1, invalid_frame_id]；成功原样返回，尚未分配任何帧。
-// 最大值允许作为“数量”，合法帧下标仍严格小于 invalid_frame_id 这个哨兵。
-// 越界抛 invalid_argument，错误对象分配失败透传；不修改已有对象或文件。
 std::size_t checked_frame_count(std::size_t count)
 {
     if (count == 0 || count > invalid_frame_id)
@@ -47,6 +51,18 @@ std::size_t checked_frame_count(std::size_t count)
 
 }
 
+/*
+    STRUCTS : PAGE KEY AND FRAME
+    docs:
+        page_key identifies a cached page by both file ID and page ID.
+        hash_page_key mixes those IDs; collisions are permitted and hashes are never persisted.
+        frame owns one 8192-byte page buffer plus identity, pin_count, valid and dirty fields.
+
+    methods:
+        page_key::operator== : Compare both IDs without consulting file registration.
+        frame::reset         : Reset metadata without clearing the page bytes or performing I/O.
+        frame::set           : Assign metadata without validating it or updating pool indexes/LRU/free list.
+*/
 bool page_key::operator==(const page_key & k)const noexcept
 {
     return fid == k.fid && pid == k.pid;
@@ -85,35 +101,26 @@ void frame::set(file_id f,page_id p,std::uint32_t pc,bool v,bool d)noexcept
 
 
 /*
+    CLASS : PAGE TABLE
+    docs:
+        Map (file_id,page_id) to frame_id using a hash table; own neither pages nor frames.
+        Overloads taking separate IDs have the same behavior as the page_key overloads.
 
-Class: PAGE TABLE
+    methods:
+        constructor : Create an empty mapping.
+        query       : Return the frame ID, or invalid_frame_id when absent.
+        contains    : Test key membership without validating the file or resident frame.
+        insert      : Add a new mapping; return false without overwriting an existing key.
+        erase       : Remove only the mapping; return false when absent, without releasing a frame.
+        clear       : Remove all mappings without touching pages or files.
+        empty/size  : Report membership count, not allocated capacity or bucket count.
+        reserve     : Reserve buckets for at least cap entries without inserting any mapping.
 
-Docs:
-    Maps each page key (file_id, page_id) to its corresponding frame_id.
-    Uses a hash table for efficient page lookup in the buffer pool.
-
-Class Methods:
-    page_table()                                  -> initialize an empty page table
-    query(file_id fid, page_id pid)               -> return the corresponding frame_id;
-                                                     invalid_frame_id if not found
-    query(const page_key& pk)                     -> return the corresponding frame_id;
-                                                     invalid_frame_id if not found
-    contains(file_id fid, page_id pid)            -> whether the page exists in the table
-    contains(const page_key& pk)                  -> whether the page exists in the table
-    insert(file_id fid, page_id pid, frame_id frid)-> insert a page-to-frame mapping;
-                                                     false if the page already exists
-    insert(const page_key& pk, frame_id fid)      -> insert a page-to-frame mapping;
-                                                     false if the page already exists
-    erase(file_id fid, page_id pid)               -> remove the page mapping;
-                                                     false if the page does not exist
-    erase(const page_key& pk)                     -> remove the page mapping;
-                                                     false if the page does not exist
-    clear()                                       -> remove all page mappings
-    empty()                                       -> whether the page table is empty
-    size()                                        -> number of page mappings
-    reserve(std::size_t cap)                      -> reserve buckets for at least cap elements
-
+    errors:
+        Callers supply valid frame IDs and associations; this class does not check frame uniqueness.
+        Allocation failures propagate; failed single insertions preserve existing mappings.
 */
+
 
 page_table::page_table(){}
 
@@ -187,21 +194,24 @@ void page_table::reserve(std::size_t cap)
 
 
 /*
+    CLASS : FREE LIST
+    docs:
+        Track free frame IDs with array-based links. Own no page buffers.
+        Initially every frame in [0,cap) is free and allocation order is increasing.
 
-Class: FREE LIST
+    methods:
+        constructor     : Initialize all links and membership bits.
+        empty/size      : Report the number of frames currently available.
+        contains        : Check whether an in-range frame ID is free; out-of-range returns false.
+        get_empty_frame : Remove the head; return invalid_frame_id without changes when empty.
+        push            : Return a frame to the head; reject out-of-range/already-free IDs with false.
+        clear           : Restore all IDs in increasing order without clearing actual frame bytes.
 
-Docs:
-    Manages free frame IDs for allocation.
-
-Class Methods:
-    empty()                 -> whether the free list is empty
-    size()                  -> number of available frames
-    contains(frame_id fid)  -> whether the frame is free; false if OOR
-    get_empty_frame()       -> allocate a free frame; invalid_frame_id if empty
-    push(frame_id fid)      -> return a used frame; false if OOR or already free
-    clear()                 -> restore every frame to the free list
-
+    errors:
+        Capacity 0 or greater than invalid_frame_id -> invalid_argument; allocation failures propagate.
+        Callers must release actual frame ownership before push/clear; list operations perform no I/O.
 */
+
 
 free_list::free_list(std::size_t cap):next(checked_frame_count(cap)),linked(cap,true),head(0),count(cap)
 {
@@ -268,25 +278,26 @@ void free_list::clear()noexcept
 
 
 /*
+    CLASS : _LIST
+    docs:
+        A fixed-capacity doubly linked list whose members are frame IDs, stored in parallel arrays.
+        Own neither frame data nor pin counts. Front/back represent most/least recent positions.
 
-Class: _LIST
+    methods:
+        constructor : Start empty; cap may be zero and must not exceed invalid_frame_id.
+        empty/size  : Report membership, not capacity.
+        contains    : Return false for absent or out-of-range IDs.
+        push_front  : Add an absent in-range ID; otherwise return false without changes.
+        move_front  : Move an existing member; return true even when already at the front.
+        erase       : Unlink a member; absent/out-of-range IDs return false.
+        pop_back    : Remove the tail, or return invalid_frame_id for an empty list.
+        clear       : Reset links/membership while retaining capacity and external frame contents.
 
-Docs:
-    A fixed-capacity, array-based doubly linked list for an LRU cache.
-    Stores frame IDs and does not own the frames themselves.
-
-Class Methods:
-    empty()                  -> Whether the list is empty.
-    size()                   -> Number of frames currently in the list.
-    contains(frame_id fid)   -> Whether the list contains this frame.
-    push_front(frame_id id)  -> Insert a frame at the front if it is not
-                                 already in the list.
-    move_front(frame_id id)  -> Move an existing frame to the front.
-    erase(frame_id fid)      -> Remove a frame from the list.
-    pop_back()               -> Remove and return the last frame.
-                                 Returns invalid_frame_id if the list is empty.
-    clear()                  -> remove all entries
+    errors:
+        Constructor allocation failures propagate; capacity is a caller precondition.
+        Operations after construction do not allocate and are noexcept.
 */
+
 
 _List::_List(std::size_t cap) : prev(std::vector<frame_id>(cap,invalid_frame_id)),
                                 next(std::vector<frame_id>(cap,invalid_frame_id)),
@@ -406,27 +417,27 @@ void _List::clear()noexcept
 
 
 /*
+    CLASS : LRU LIST
+    docs:
+        Wrap _List with one pinned flag per frame. The front is most recently accessed.
+        Pin flags are eligibility bits, not reference counts; the buffer pool maintains the counts.
+        Membership includes pinned frames, so a nonempty list can still have no eviction candidate.
 
-Class: LRU LIST
+    methods:
+        constructor   : Start empty with all flags clear; cap may be zero, at most invalid_frame_id.
+        empty/size    : Report all members, including pinned ones.
+        contains      : Check membership independently of pin state; out-of-range returns false.
+        record_access : Insert or move an in-range ID to the front without changing its pin flag.
+        victim        : With a supplied ID, inspect only it; otherwise scan backward from the tail.
+                        Return invalid_frame_id when absent/pinned or no eligible member exists.
+                        remove=false only inspects; remove=true unlinks the selected member.
+        pin/unpin     : Set/clear an in-range flag; ignore out-of-range IDs and do not count calls.
+        clear         : Remove all members and clear all pin flags without touching page data.
 
-Docs:
-    A lightweight wrapper around _List for LRU cache management.
-    Maintains access order and tracks pinned frames.
-    The front stores the most recently accessed frame, while the
-    back stores the least recently accessed frame.
-
-Class Methods:
-    empty()                    -> whether the list is empty
-    size()                     -> number of frames currently in the list
-    contains(frame_id fid)     -> whether the frame is in the list
-    pin(frame_id fid)          -> mark the frame as pinned
-    unpin(frame_id fid)        -> mark the frame as unpinned
-    record_access(frame_id fid)-> move the frame to the front; false if OOR
-    victim()                   -> remove and return the least recently used
-                                  unpinned frame; invalid_frame_id if none
-    clear()                    -> remove all entries and pin flags
-
+    errors:
+        Constructor allocation failures propagate; post-construction methods do not allocate or do I/O.
 */
+
 
 
 
@@ -513,32 +524,30 @@ bool  LRU_list::record_access(frame_id fid)noexcept
 
 
 /*
+    CLASS : PAGE GUARD
+    docs:
+        A move-only RAII borrow of one resident frame, holding exactly one pin until released.
+        Own neither the pool nor the file. The pool must outlive every guard and borrowed page pointer.
+        Callers must not directly close the file while a guard exists. This is not a lock or transaction.
 
-Class: PAGE GUARD
+    methods:
+        constructor     : Pool-only construction; pin a valid resident frame without allocation or I/O.
+        move constructor: Transfer the existing pin/access mode; leave the source empty and read-only.
+        move assignment : Release this pin, then transfer the source; self-move changes nothing.
+        destructor      : Release the pin without flushing, clearing dirty state or reporting I/O errors.
+        view            : Borrow a const page pointer; empty guards return nullptr without marking dirty.
+        get             : Borrow a mutable pointer only when valid and writable; immediately mark dirty.
+        release         : Unpin once and become empty; repeated release is harmless.
+        frame           : Return the frame ID, or invalid_frame_id when empty.
+        file/page_no    : Return the page identity, or 0 when empty; file ID 0 is also a valid ID.
+        writable        : Report write permission; permission alone does not mark the page dirty.
+        operator bool   : Check the stored pool pointer/frame sentinel, without probing OS state.
 
-Docs:
-    A move-only RAII handle for managing page access in the buffer pool.
-    Keeps the associated frame pinned during its lifetime and automatically
-    unpins it upon release or destruction.
-    Provides read-only or writable access to the underlying page.
-
-Class Methods:
-    ~page_guard()                  -> release the held frame automatically
-    page_guard(page_guard&&)       -> transfer ownership from another guard
-    operator=(page_guard&&)        -> release the current frame and take
-                                      ownership from another guard
-    view()                         -> get a const pointer to the page;
-                                      nullptr if the guard is invalid
-    get()                          -> get a mutable pointer to the page;
-                                      nullptr if invalid or not writable
-    release()                      -> unpin the frame and invalidate the guard
-    frame()                        -> get the associated frame ID
-    file()                         -> get the ID of the file containing the page
-    page_no()                      -> get the page ID within the file
-    writable()                     -> whether the guard permits write access
-    operator bool()                -> whether the guard is valid
-
+    errors:
+        Copying is disabled. Page pointers expire when their pin is released; moving transfers that lifetime.
+        Empty/read-only get() returns nullptr. Pool-only construction requires a valid, non-null pool.
 */
+
 
 
 page_guard::page_guard(frame_id fid,buffer_pool_manager* bpm_,bool can_write_)noexcept:f(fid),bpm(bpm_),can_write(can_write_)
@@ -652,14 +661,67 @@ bool page_guard::writable()const noexcept
 
 
 /*
+    CLASS : BUFFER POOL MANAGER
+    docs:
+        Own a fixed set of page frames in one thread; cache only data pages with pid >= 1.
+        Borrow file_manager, which must outlive this pool; all guards must be released before destruction.
+        Copying/moving is disabled so guard pointers keep referring to the same pool.
+        Page table and per-file page sets describe exactly the same resident frames.
+        Registered cached files must use this pool for page access and coordinated closure.
 
-Class : BUFFER POOL MANAGER
+    methods:
+        constructor : Allocate [1,invalid_frame_id] frames, initially free with zero statistics; no I/O.
+        destructor  : Best-effort flush each dirty frame, ignoring errors; do not close files.
+        fetch_page  : Validate file/page/access, record hit/miss, and return a guard with one new pin.
+                      Read guards permit view only; write guards mark dirty only when get() is called.
+        new_page    : Acquire a frame before appending a zero page; return a writable, initially clean guard.
+                      Do not count hits/misses. No available frame means no disk allocation.
+        flush_page  : Return whether a page is resident, even when clean; pinned pages may be written.
+        flush_file  : Write this file's resident dirty pages; return successful writes, zero when none reside.
+        flush_all   : Write valid dirty frames in frame order; return the number actually written.
+        evict_page  : Write and remove an unpinned page, return its frame and increment evictions.
+                      Missing/pinned pages return false without a write; disk pages are not deleted.
+        discard_page: Drop an unpinned page without writing or changing statistics; caller accepts data loss.
+                      Missing/pinned pages return false; disk pages remain allocated.
+        flush_and_invalidate_file : Reject any pin first, flush all dirty pages, then remove all mappings.
+                                    Return removed resident count, not write count; do not count evictions.
+        close_file  : Validate registration, flush/invalidate, then close/unregister through file_manager.
+        shutdown    : Reject any pin before writing; flush, then reset the cache without closing files.
+                      Statistics remain, repeated shutdown is safe, and the pool can be reused.
+        frame_count/free_frame_count/cached_page_count : Report capacity, free frames and resident mappings.
+        stats       : Borrow live counters; copy explicitly for a snapshot. Hits/misses count valid fetches,
+                      evictions count automatic/explicit eviction, writebacks count successful dirty writes.
+        check_invariants : Check mappings, frames, free list, LRU and pins; do not repair or perform I/O.
 
-Docs:
-    Single-threaded page cache. The page table and per-file page sets describe
-    the same resident frames. See include/db/storage/buffer_pool.h for
-    lifecycle, error handling and statistics contracts.
+    helpers:
+        get_frame   : Borrow an in-range frame; out-of-range returns nullptr without pinning/validation.
+        find_frame  : Return a mapping or invalid_frame_id, without checking file lifecycle/page bounds.
+        acquire_frame : Take a free frame or write/evict an unpinned LRU victim; return invalid_frame_id
+                        if all candidates are pinned. Caller must register the frame or return it on failure.
+        pin/unpin   : Maintain pin_count and LRU eligibility at transitions 0/1; ignore invalid IDs.
+                      pin requires a valid resident frame and a non-overflowing counter; unpin ignores zero.
+        mark_dirty  : Mark an in-range resident frame; ignore out-of-range IDs.
+        write_back  : Write valid dirty frames; keep dirty while any pin remains, even after a successful write.
+        add_mapping : Add page/per-file entries together, rolling back new entries if insertion fails.
+        remove_mapping : Remove both entries and empty per-file sets; do not reset the frame or LRU.
+
+    errors:
+        Bad capacity/access -> invalid_argument; page 0/out-of-range page -> invalid_page;
+        unknown/closed file -> invalid_file_handle; no available frame -> buffer_exhausted;
+        active guards blocking closure/shutdown -> resource_busy; broken invariants -> internal_error.
+        File-layer errors and allocation failures propagate. Invalid fetch arguments do not change counters;
+        a valid miss is counted even if later I/O fails. Failed read/mapping returns its acquired frame.
+        Dirty write failure preserves mappings and dirty state; disk bytes may already be partially written.
+        Successful earlier writes/evictions/counters are not rolled back after a later failure.
+        Successful disk allocation followed by mapping failure leaves the new disk page allocated.
+        Invalidation removes mappings only after all writes succeed; earlier writes may already clear dirty.
+        After invalidation, header-save failure leaves the file registered; once the close syscall runs,
+        even close failure unregisters it. Repeated close_file reports invalid_file_handle.
+        Missing cached pages need not validate their file handles. flush_file traverses an unspecified order.
+        Invariant checks may allocate and do not validate file liveness or page contents.
+        Flush completion does not provide fsync, transaction rollback or power-loss recovery.
 */
+
 
 frame * buffer_pool_manager::get_frame(frame_id fid)noexcept
 {
@@ -681,12 +743,12 @@ frame_id buffer_pool_manager::find_frame(file_id fid,page_id pid)const
 
 frame_id buffer_pool_manager::acquire_frame()
 {
-    //尝试利用free list中的空页
+    // Prefer a free frame before selecting an eviction candidate.
     frame_id candidate = free_frames.get_empty_frame();
     if(candidate != invalid_frame_id)
         return candidate;
 
-    //没有空闲的话，在lru cache中找一个
+    // Inspect the LRU candidate without unlinking it yet.
     candidate = lru.victim(false);
     if(candidate == invalid_frame_id)
         return candidate;
@@ -694,7 +756,7 @@ frame_id buffer_pool_manager::acquire_frame()
     frame * fr = get_frame(candidate);
     if(!fr)
         return invalid_frame_id;
-    //如果脏了的话就写回去
+    // Preserve the old mapping if the dirty write fails.
     if(fr->dirty)
         write_back(*fr);
 
@@ -832,7 +894,7 @@ page_guard buffer_pool_manager::fetch_page(file_id fid,page_id pid,access_type a
     if (pid >= fh.get_num_pages())
         throw pool_error(error_code::invalid_page, "page ID is out of range",
                          "buffer_pool.fetch_page", fid, pid);
-    //先从buffer pool之中寻找
+    // Check whether the page is already resident.
     frame_id candidate = find_frame(fid,pid);
     bool can_write = (access == access_type::write);
     if(candidate != invalid_frame_id)
@@ -1051,8 +1113,7 @@ const buffer_pool_stats & buffer_pool_manager::stats() const noexcept
 
 void buffer_pool_manager::check_invariants() const
 {
-    // 只检查调用方给出的布尔条件：真则返回，假则抛带诊断文本的 internal_error。
-    // message 须为有效 C 字符串；不修复结构、不改变统计，错误构造可抛分配异常。
+    // Report a failed invariant without repairing state or changing counters.
     auto require = [](bool ok, const char * message) {
         if (!ok)
             throw pool_error(error_code::internal_error, message, "buffer_pool.check_invariants");

@@ -1,10 +1,11 @@
 #include "db/storage/file_manager.h"
 #include <unistd.h>      // close(), pread(), pwrite()
-#include <fcntl.h>       // open(), O_RDWR 等（如果这里不用open可以暂时不需要）
+#include <fcntl.h>       // open(), O_RDWR
 #include <cerrno>        // errno
 #include <cstring>       // memset, strerror
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <sys/stat.h>
 
@@ -17,8 +18,24 @@ constexpr off_t num_pages_offset = sizeof(file_header::magic_number) + sizeof(fi
 
 namespace {
 
-// 按值复制操作名和路径到独立错误上下文，不检查路径是否存在；不修改输入或文件。
-// 字符串复制可能抛分配异常，尚未完成的上下文不会向调用者发布。
+/*
+    HELPERS : FILE ERROR CONTEXT
+    docs:
+        Build owning diagnostic values without changing files or caller state.
+        String allocation failures propagate; constructing an error does not undo I/O.
+
+    methods:
+        path_context    : Copy operation/path; do not check whether the path exists.
+        throw_os_error  : Throw the chosen code with saved errno; preserve other context fields.
+        path_error_code : Map EEXIST to object_exists, ENOENT/ENOTDIR to object_not_found,
+                          and other saved error numbers to io_error.
+        validate_io     : Require a non-null buffer for nonzero size, a nonnegative offset,
+                          and a representable offset + size; otherwise throw invalid_argument.
+
+    errors:
+        Buffer extent/accessibility and valid operation strings remain caller preconditions.
+        Zero-size I/O permits nullptr. Validation performs no I/O and never dereferences buffers.
+*/
 error_context path_context(const std::string& operation, const std::string& path)
 {
     error_context result;
@@ -27,12 +44,6 @@ error_context path_context(const std::string& operation, const std::string& path
     return result;
 }
 
-/**
- * 把调用方在失败现场保存的 errno 转成指定 code 的 db_error，默认 io_error。
- * context 按值接收，覆盖其中 operation/os_error，保留路径、对象和页等其他字段。
- * 始终抛出；错误文本/上下文分配失败可改为抛标准分配异常，不执行清理或 I/O。
- * 因此它不撤销此前系统调用造成的状态，调用方仍负责关闭和失败边界判断。
- */
 [[noreturn]] void throw_os_error(const std::string& operation, int saved_errno,
                                 error_context context = {},
                                 error_code code = error_code::io_error)
@@ -42,8 +53,6 @@ error_context path_context(const std::string& operation, const std::string& path
     throw db_error(code, operation + ": " + std::strerror(saved_errno), std::move(context));
 }
 
-// 将已保存 errno 映射到路径类错误：EEXIST→object_exists，
-// ENOENT/ENOTDIR→object_not_found，其余→io_error；不读当前 errno，不修改状态。
 error_code path_error_code(int saved_errno)
 {
     if (saved_errno == EEXIST)
@@ -53,12 +62,6 @@ error_code path_error_code(int saved_errno)
     return error_code::io_error;
 }
 
-/**
- * 仅验证 I/O 参数形状：非零长度需非空 buffer，offset 非负，offset+size 可由 off_t 表示。
- * buffer 的实际可访问字节数和读写权限仍由调用方保证；operation 必须为有效 C 字符串。
- * 不合法时抛 invalid_argument（构造异常可能分配失败），合法时直接返回。
- * 不解引用 buffer，不发起 I/O，不改变内存或磁盘；size=0 允许 buffer=nullptr。
- */
 void validate_io(const void* buffer, std::size_t size, off_t offset,
                  const char* operation)
 {
@@ -74,6 +77,26 @@ void validate_io(const void* buffer, std::size_t size, off_t offset,
 } // namespace
 
 
+/*
+    FUNCTIONS : FILE I/O AND BYTE ENCODING
+    docs:
+        Borrow descriptors and caller-owned buffers; do not close descriptors or change their offsets.
+        Byte helpers use little-endian encoding and require accessible buffers of 4 or 8 bytes.
+
+    methods:
+        normalize_path : Resolve an absolute, weakly canonical path; missing suffixes are allowed.
+        safe_read      : Read exactly n bytes with pread, retrying EINTR and short reads.
+        safe_write     : Write exactly n bytes with pwrite, retrying EINTR and short writes.
+        read_u32/u64   : Decode an unsigned value without validation, allocation or I/O.
+        write_u32/u64  : Write only the bytes of the requested unsigned value.
+
+    errors:
+        Empty paths or invalid I/O extents -> invalid_argument; early EOF -> invalid_format.
+        Path resolution, system I/O failures and zero-progress writes -> io_error.
+        Zero-size reads/writes issue no syscall. I/O failures may leave a partially changed buffer/file.
+        Byte helpers do not validate pointers; path normalization is not a filesystem lock.
+        Successful writes do not provide rollback, fsync or crash recovery.
+*/
 std::string normalize_path(const std::string & path)
 {
     if (path.empty())
@@ -179,6 +202,21 @@ uint64_t read_u64(const void* ssrc)noexcept
 }
 
 
+/*
+    CLASS : FD GUARD
+    docs:
+        Own one temporary descriptor; -1 means empty. Copying and moving are disabled.
+        After adoption, only this guard or the recipient of release() may close the descriptor.
+
+    methods:
+        constructor : Adopt a descriptor without validation or I/O.
+        get         : Borrow the descriptor; ownership stays with the guard.
+        release     : Return the descriptor and become empty; repeated calls return -1.
+        destructor  : Close a nonempty descriptor once, without retries or exceptions.
+
+    errors:
+        Destruction ignores close failures. Use an explicit checked close when errors must be reported.
+*/
 fd_guard::fd_guard(int fd)noexcept:fd_(fd){}
 
 int fd_guard::get()const noexcept{
@@ -200,6 +238,26 @@ fd_guard::~fd_guard()noexcept
 
 
 
+/*
+    STRUCT : FILE HEADER
+    docs:
+        Describe page 0 of a page file; the page count includes page 0 itself.
+        The constexpr constructor stores fields without validation; its defaults are not a valid header.
+
+    layout:
+        0 : magic_number -> uint32_t, 0x114514
+        4 : version      -> uint32_t, 1
+        8 : page_size    -> uint64_t, 8192
+        16: num_pages    -> uint64_t, at least 1 and representable as a complete file extent
+
+    methods:
+        write_header : Encode the first 24 bytes, leaving the rest of the page unchanged.
+        read_header  : Decode and validate all four fields, returning an independent value.
+
+    errors:
+        Bad magic, version, page size or page count -> invalid_format.
+        These methods do not check the actual file length or issue I/O.
+*/
 void file_header::write_header(page& p) const
 {
     write_u32(p.data()+0, magic_number);
@@ -239,6 +297,38 @@ file_header file_header::read_header(const page& p)
 
 
 
+/*
+    CLASS : FILE HANDLE
+    docs:
+        Own one descriptor, its logical page count and optional diagnostic path; not thread-safe.
+        The default constructor creates a closed handle. The parameterized constructor adopts the
+        descriptor and trusts supplied metadata without opening, validating or registering the file.
+        Manager-owned handles are borrowed by callers; cached files must be accessed/closed through bpm.
+
+    methods:
+        is_open       : Report whether this object owns a descriptor, without probing the OS.
+        read_page     : Read an existing page, including page 0, into a borrowed destination.
+        write_page    : Write an existing data page; page 0 is reserved for the file manager.
+        allocate_page : Append a zero-filled page and return its previous logical page count as the ID.
+        append_page   : Append the supplied page; increase the count only after a complete write.
+        close         : Save a dirty page count, then close; already-closed handles are harmless.
+        get_id        : Return the assigned ID, even after closure.
+        get_num_pages : Return the in-memory count, including page 0; do not inspect file length.
+        destructor    : Best-effort save/close; still close once if saving the header fails.
+
+    helpers:
+        context     : Own operation, file ID, optional page ID and a nonempty diagnostic path.
+        calc_offset : Require an open handle and a representable whole-page offset; normal access
+                      also requires idx < num_pages. Append callers supply exactly num_pages.
+
+    errors:
+        Closed handles -> invalid_file_handle; bad page extents/page-0 writes -> invalid_page.
+        Truncated reads -> invalid_format; system failures -> io_error; allocations may propagate.
+        Failed append preserves the in-memory count but can leave partial trailing bytes on disk.
+        Header-write failure during close keeps the handle open and dirty. Once close is called on
+        the descriptor, ownership is cleared even if it fails; that descriptor is never retried.
+        Page writes do not invalidate cached copies. There is no rollback, fsync or crash recovery.
+*/
 file_handle::file_handle():num_pages(0),id(0),os_id(-1),dirty(false){}
 
 
@@ -388,6 +478,47 @@ file_id file_handle::get_id()const noexcept{
 }
 
 
+/*
+    CLASS : FILE MANAGER
+    docs:
+        Own file handles and three unordered lookup tables: file ID, canonical path and device/inode.
+        Reject repeated opens through either the same path or a hard-link alias; no sorted order is used.
+        Operate in one thread without a cross-process lock. The manager must outlive its buffer pools.
+        External code must not rename, replace, truncate or directly close registered files.
+
+    methods:
+        constructor : Start with no files and next file ID 0; create no directories.
+        create_file : Exclusively create a one-page file with a valid header; do not register it.
+        open_file   : Open read/write, validate the header and minimum length, then register all keys.
+        close_file  : Save/close a registered handle and remove its three lookup entries.
+        remove_file : Unlink a normalized path; reject an open file, including hard-link aliases.
+        get_file    : Borrow a registered handle without opening it or probing its descriptor.
+        destructor  : Destroy handles with best-effort cleanup; all borrowed references expire.
+
+    helpers:
+        physical_identity_hash : Mix device and inode hashes; equality still compares both fields.
+        unregister_file        : Remove all lookup entries; absent IDs are harmless.
+
+    errors:
+        Empty paths -> invalid_argument; missing paths -> object_not_found; existing create targets
+        -> object_exists; duplicate/open aliases -> resource_busy; exhausted IDs -> resource_limit.
+        Nonregular files, malformed headers and short files -> invalid_format; OS failures -> io_error.
+        IDs increase without reuse; the maximum uint64_t value is not allocated. Trailing bytes are allowed.
+        Failed open rolls back registration and closes its temporary descriptor without repairing the file.
+        Failed create removes only its newly created file; db_error retains a secondary unlink error
+        in cleanup_os_error. Allocation failures propagate and temporary close failures are ignored.
+        Failed header save on close preserves registration; after the close syscall, success or failure
+        removes registration and invalidates borrowed handles. Repeated close reports invalid_file_handle.
+        Cached files must close through bpm. Removing files does not recursively remove directories,
+        automatically close handles, or guarantee crash durability; symlinks resolve to their targets.
+*/
+std::size_t file_manager::physical_identity_hash::operator()(const physical_identity& identity)const noexcept
+{
+    std::size_t device = std::hash<dev_t>{}(identity.first);
+    std::size_t inode = std::hash<ino_t>{}(identity.second);
+    return device ^ (inode + std::size_t{0x9e3779b9} + (device << 6) + (device >> 2));
+}
+
 file_manager::file_manager():next(0){}
 
 
@@ -403,9 +534,8 @@ void file_manager::create_file(const std::string & path)const
     fd_guard guard(os_id);
     // This manager is single-threaded and operates on its managed directory.
     // Only the path successfully created by this call is eligible for cleanup.
-    // 仅用于本次 O_EXCL 成功创建后的失败清理；借用仍存活的 guard 和 normalized_path。
-    // 先释放 guard 所有权并最多提交一次 close，再 unlink 本次路径；不重试系统 close。
-    // 返回 0 或 unlink 的 errno；close 错误不报告。无异常，但失败可留下本次新建文件。
+    // Clean up only the file created by this O_EXCL call: close once, then unlink.
+    // Return unlink's errno; a cleanup failure can leave the new file on disk.
     const auto cleanup = [&]() noexcept -> int {
         const int owned_fd = guard.release();
         if (owned_fd != -1)

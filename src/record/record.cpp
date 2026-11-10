@@ -112,7 +112,7 @@ void record_page_helper::init(page& p, slot_id record_size)
     const slot_id num_slots = capacity(record_size);
     clear(p);
     /*
-    写入page header:
+    Write the page header:
         magic               ->uint32_t
         version             ->uint32_t
         record_size         ->uint32_t , measured in bytes
@@ -134,7 +134,7 @@ void record_page_helper::init(page& p, slot_id record_size)
 
 void record_page_helper::validate(const page& p,std::uint32_t expected_record_size)
 {
-    // 参数错误和页内格式错误分别报告。
+    // Distinguish invalid arguments from corrupt page contents.
     const slot_id expected_slots = capacity(expected_record_size);
     const std::byte * src = p.data();
     const std::uint32_t magic = read_u32(src);
@@ -189,7 +189,7 @@ void record_page_helper::validate(const page& p,std::uint32_t expected_record_si
             "nonzero unused bitmap bits"
         );
 
-    // C++17 下逐字节统计，不调用会再次 validate 的公开 record_count。
+    // Count bits bytewise without recursively validating through record_count().
     slot_id tot = 0;
     for(slot_id i = 0;i < bitmap_bytes;++i)
     {
@@ -344,7 +344,7 @@ std::optional<slot_id> record_page_helper::insert(page& p,const record_bytes& by
     const std::size_t offset = get_record_offset(p,*idx);
     const slot_id orig_live_count = read_u32(p.data()+live_count_offset);
 
-    // 检查全部完成，下面只修改内存字节，不进行 I/O 或分配。
+    // All checks are complete; the remaining memory writes do not allocate or perform I/O.
     std::memcpy(p.data()+offset,bytes.data(),record_size);
     p[byte_offset] |= static_cast<std::byte>(1u << bit_offset);
     write_u32(p.data()+live_count_offset,orig_live_count + 1);
@@ -827,18 +827,26 @@ record_scan record_file::scan() const
 
 
 /*
+    CLASS : RECORD SCAN
+    docs:
+        Iterate occupied records in increasing page/slot order, returning independent byte copies.
+        Borrow a record_file at a stable address; it, its storage managers and file must outlive the scan.
+        Callers must not modify or close the file during scanning; no snapshot or concurrent-write support.
+        Hold page guards only inside next(), never between calls.
 
+    methods:
+        constructor      : Capture the exclusive end page from the file's current page count.
+                           Start at first_record_data_page and slot 0, in the active state.
+        next             : Validate each visited page, skip unused slots and completely empty pages,
+                           then return one RID and record copy. Advance past a record only after copying it.
+                           End of range becomes exhausted; every later next() returns nullopt.
+        move constructor : Transfer the file pointer, bounds, cursor and state; mark the source moved.
 
-
-
-
-
-
-
-
+    errors:
+        Copying and move assignment are disabled. next() on moved/failed scans -> invalid_argument.
+        Storage, format and allocation failures propagate and mark the scan failed; it cannot resume.
+        Later file growth is outside the captured range. No disk writes or metadata changes occur.
 */
-
-
 
 record_scan::record_scan(const record_file& file):file_(&file)
 {
