@@ -22,17 +22,18 @@ namespace db {
 	// Reusable buffer-pool slot, never a persistent record address.
 	typedef std::uint32_t frame_id;
 	typedef std::uint32_t slot_id;
-	// Persistent catalog IDs start at 1; 0 means unassigned, unlike runtime file_id.
+	// Persistent catalog IDs start at 1; each type's maximum means unassigned.
+	// Zero remains outside the allocated catalog ID range; runtime file_id may be 0.
 	typedef std::uint64_t database_id;
 	typedef std::uint64_t table_id;
 	typedef std::uint64_t index_id;
 	typedef std::uint64_t constraint_id;
 	typedef std::uint32_t column_id;
-	constexpr database_id invalid_database_id = 0;
-	constexpr table_id invalid_table_id = 0;
-	constexpr index_id invalid_index_id = 0;
-	constexpr constraint_id invalid_constraint_id = 0;
-	constexpr column_id invalid_column_id = 0;
+	constexpr database_id invalid_database_id = std::numeric_limits<database_id>::max();
+	constexpr table_id invalid_table_id = std::numeric_limits<table_id>::max();
+	constexpr index_id invalid_index_id = std::numeric_limits<index_id>::max();
+	constexpr constraint_id invalid_constraint_id = std::numeric_limits<constraint_id>::max();
+	constexpr column_id invalid_column_id = std::numeric_limits<column_id>::max();
 
 	constexpr page_id invalid_page_id = std::numeric_limits<page_id>::max();
 	constexpr slot_id invalid_slot_id = std::numeric_limits<slot_id>::max();
@@ -90,6 +91,12 @@ namespace db {
 		std::uint64_t completed_rows = 0;
 		std::optional<std::string> input_path;
 		std::optional<std::size_t> input_line;
+		void set_state(
+			statement_phase p,
+			std::uint64_t c,
+			std::optional<std::string> ip,
+			std::optional<std::size_t> il
+		);
 	};
 
 }

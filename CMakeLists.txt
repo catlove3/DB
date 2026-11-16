@@ -106,10 +106,22 @@ if(BUILD_TESTING)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_definitions(unit_catalog PRIVATE IDBS_CATALOG_FAILURE_TESTS)
         target_link_options(unit_catalog PRIVATE
-            -Wl,--wrap=pwrite -Wl,--wrap=close -Wl,--wrap=rename)
+            -Wl,--wrap=pwrite -Wl,--wrap=close -Wl,--wrap=rename -Wl,--wrap=unlink)
     endif()
     add_test(NAME unit_catalog COMMAND unit_catalog)
     set_tests_properties(unit_catalog PROPERTIES TIMEOUT 30)
+
+    add_executable(catalog_restart_driver tests/integration/test_catalog_restart.cpp)
+    target_link_libraries(catalog_restart_driver PRIVATE db_catalog)
+    idbs_configure_target(catalog_restart_driver)
+    add_test(
+        NAME catalog_restart
+        COMMAND "${CMAKE_COMMAND}"
+                "-DTEST_PROGRAM=$<TARGET_FILE:catalog_restart_driver>"
+                "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/catalog-restart"
+                -P "${PROJECT_SOURCE_DIR}/tests/integration/test_catalog_restart.cmake"
+    )
+    set_tests_properties(catalog_restart PROPERTIES TIMEOUT 60)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

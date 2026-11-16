@@ -117,6 +117,7 @@ struct table_info
 struct root_catalog
 {
     std::uint32_t format_version = catalog_format_version;
+    // invalid_database_id means the allocator is exhausted.
     database_id next_database_id = 1;
     std::vector<database_info> databases;
 };
@@ -125,7 +126,7 @@ struct database_catalog
 {
     std::uint32_t format_version = catalog_format_version;
     database_id id = invalid_database_id;
-    // Tables, indexes and constraints share this database-local ID allocator.
+    // Tables, indexes and constraints share this allocator; uint64_t max means exhausted.
     std::uint64_t next_object_id = 1;
     std::vector<table_schema> tables;
 };
@@ -164,6 +165,8 @@ struct create_table_request
     std::optional<primary_key_definition> primary_key;
     std::vector<foreign_key_definition> foreign_keys;
 };
+
+table_schema from_definition(const create_table_request& request,database_catalog& database);
 
 class catalog_store
 {
@@ -217,6 +220,10 @@ private:
     const opened_table& require_open_table(table_id id) const;
     void release_table(table_id id) noexcept;
     void close_table(table_id id);
+    std::optional<std::size_t> find_database(database_id id) const;
+    std::optional<std::size_t> find_database(const std::string & name) const;
+    std::optional<std::size_t> find_table(const create_table_request& request) const;
+    std::optional<std::size_t> find_table(table_id id) const;
 
     catalog_store& store_;
     file_manager& fm_;
