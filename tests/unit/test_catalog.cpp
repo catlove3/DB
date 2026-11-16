@@ -690,6 +690,73 @@ namespace
         CHECK(database.next_object_id == invalid_table_id - 1);
     }
 
+    void test_definition_name_lookups()
+    {
+        database_catalog database;
+        database.id = 1;
+        create_table_request parent_request;
+        parent_request.name = "alpha";
+        parent_request.columns = {{"left",data_type::INT},{"right",data_type::VARCHAR,8}};
+        parent_request.primary_key = primary_key_definition{{"right","left"},std::nullopt};
+        table_schema alpha = from_definition(parent_request,database);
+        // Persistent column IDs need not equal their vector positions plus one.
+        alpha.columns[0].id = 17;
+        alpha.columns[1].id = 4;
+        alpha.primary_key->columns = {4,17};
+        alpha.indexes[0].columns = {4,17};
+
+        parent_request.name = "beta";
+        parent_request.columns = {{"left",data_type::FLOAT},{"right",data_type::INT}};
+        table_schema beta = from_definition(parent_request,database);
+        beta.columns[0].id = 83;
+        beta.columns[1].id = 9;
+        beta.primary_key->columns = {9,83};
+        beta.indexes[0].columns = {9,83};
+        database.tables = {beta,alpha};
+
+        create_table_request request;
+        request.name = "child";
+        request.columns = {{"a",data_type::INT},{"b",data_type::VARCHAR,8},
+                           {"c",data_type::FLOAT},{"d",data_type::INT}};
+        request.primary_key = primary_key_definition{{"a"},std::nullopt};
+        request.foreign_keys = {
+            {{"b","a"},"alpha",{"right","left"},std::nullopt},
+            {{"d","c"},"beta",{"right","left"},std::nullopt},
+            {{"b","a"},"alpha",{"right","left"},std::nullopt},
+            {{"a"},"child",{"a"},std::nullopt}
+        };
+        table_schema child = from_definition(request,database);
+        CHECK(child.columns[0].name == "a" && child.columns[3].name == "d");
+        CHECK(child.foreign_keys[0].parent_table == alpha.id);
+        CHECK(child.foreign_keys[0].child_columns == std::vector<column_id>({2,1}));
+        CHECK(child.foreign_keys[0].parent_columns == std::vector<column_id>({4,17}));
+        CHECK(child.foreign_keys[1].parent_table == beta.id);
+        CHECK(child.foreign_keys[1].parent_columns == std::vector<column_id>({9,83}));
+        CHECK(child.foreign_keys[2].parent_columns == child.foreign_keys[0].parent_columns);
+        CHECK(child.foreign_keys[3].parent_table == child.id);
+
+        std::uint64_t next = database.next_object_id;
+        create_table_request invalid = request;
+        invalid.foreign_keys[1].parent_columns[0] = "missing";
+        expect_error(error_code::object_not_found,[&]{from_definition(invalid,database);});
+        invalid = request;
+        invalid.columns[1].max_length = 9;
+        expect_error(error_code::foreign_key_violation,[&]{from_definition(invalid,database);});
+        CHECK(database.next_object_id == next);
+
+        // Maps are local to a conversion: reordered/renamed schemas must be read afresh.
+        std::swap(database.tables[0],database.tables[1]);
+        database.tables[0].name = "renamed";
+        expect_error(error_code::object_not_found,[&]{from_definition(request,database);});
+        CHECK(database.next_object_id == next);
+        request.foreign_keys[0].parent_table = "renamed";
+        request.foreign_keys[2].parent_table = "renamed";
+        child = from_definition(request,database);
+        CHECK(child.foreign_keys[0].parent_table == alpha.id);
+        CHECK(child.foreign_keys[1].parent_table == beta.id);
+        CHECK(child.foreign_keys[2].parent_columns == std::vector<column_id>({4,17}));
+    }
+
     void test_create_table()
     {
         temp_dir tmp;
@@ -1047,6 +1114,7 @@ int main()
         test_database_manager_failures();
         test_database_id_exhaustion();
         test_definition_conversion();
+        test_definition_name_lookups();
         test_create_table();
         test_table_leases_and_switching();
         test_open_table_validation();

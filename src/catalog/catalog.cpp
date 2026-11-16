@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <limits>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <unistd.h>
 
@@ -627,6 +628,20 @@ namespace
         return next_object_id++;
     }
 
+    using name_positions = std::unordered_map<std::string,std::size_t>;
+
+    // Build once per conversion; positions refer to the supplied schema vector, not persistent IDs.
+    template<class T>
+    name_positions make_name_positions(const std::vector<T>& schemas,const char* duplicate_message)
+    {
+        name_positions positions;
+        positions.reserve(schemas.size());
+        for(std::size_t i = 0;i < schemas.size();++i)
+            if(!positions.emplace(schemas[i].name,i).second)
+                throw db_error(error_code::object_exists,duplicate_message);
+        return positions;
+    }
+
     std::vector<column_schema> from_definition(const std::vector<column_definition>& its)
     {
         if(its.empty())
@@ -635,14 +650,11 @@ namespace
             throw db_error(error_code::resource_limit,"column IDs are exhausted");
         std::vector<column_schema> new_columns;
         new_columns.reserve(its.size());
-        std::set<std::string> names;
         for(std::size_t i = 0;i < its.size();++i)
         {
             column_schema new_column;
             const column_definition & it = its[i];
             check_definition_name(it.name);
-            if(!names.insert(it.name).second)
-                throw db_error(error_code::object_exists,"duplicate column name");
             if(!it.has_default && !std::holds_alternative<std::monostate>(it.default_value))
                 throw db_error(error_code::invalid_argument,"default value without DEFAULT");
             new_column.declared_nullable = it.nullable;
@@ -660,39 +672,45 @@ namespace
         return new_columns;
     }
 
-    const column_schema& find_column(const table_schema& table,const std::string& name)
-    {
-        for(const column_schema& column : table.columns)
-            if(column.name == name)
-                return column;
-        throw db_error(error_code::object_not_found,"column does not exist: " + name);
-    }
-
-    std::vector<column_id> resolve_columns(const table_schema& table,const std::vector<std::string>& names)
+    std::vector<const column_schema*> resolve_columns(const table_schema& table,const name_positions& positions,
+                                                      const std::vector<std::string>& names)
     {
         if(names.empty())
             throw db_error(error_code::invalid_argument,"empty constraint key");
-        std::vector<column_id> columns;
+        std::vector<const column_schema*> columns;
         columns.reserve(names.size());
-        std::set<column_id> seen;
+        std::unordered_set<column_id> seen;
+        seen.reserve(names.size());
         for(const std::string& name : names)
         {
-            column_id id = find_column(table,name).id;
-            if(!seen.insert(id).second)
+            name_positions::const_iterator found = positions.find(name);
+            if(found == positions.end())
+                throw db_error(error_code::object_not_found,"column does not exist: " + name);
+            const column_schema& column = table.columns[found->second];
+            if(!seen.insert(column.id).second)
                 throw db_error(error_code::invalid_argument,"duplicate column in constraint key");
-            columns.push_back(id);
+            columns.push_back(&column);
         }
         return columns;
     }
 
+    std::vector<column_id> column_ids(const std::vector<const column_schema*>& columns)
+    {
+        std::vector<column_id> ids;
+        ids.reserve(columns.size());
+        for(const column_schema* column : columns)
+            ids.push_back(column->id);
+        return ids;
+    }
+
     primary_key_schema from_definition(const primary_key_definition& it,const table_schema& table,
-                                       constraint_id id,index_id index)
+                                       const name_positions& positions,constraint_id id,index_id index)
     {
         primary_key_schema key;
         key.id = id;
         key.name = it.name.value_or("pk_" + std::to_string(id));
         check_definition_name(key.name);
-        key.columns = resolve_columns(table,it.columns);
+        key.columns = column_ids(resolve_columns(table,positions,it.columns));
         key.index = index;
         return key;
     }
@@ -700,7 +718,9 @@ namespace
     foreign_key_schema from_definition(
         const foreign_key_definition& it,
         const table_schema& child,
-        const database_catalog& database,
+        const name_positions& child_positions,
+        const table_schema& parent,
+        const name_positions& parent_positions,
         constraint_id id,
         index_id child_index
     )
@@ -710,34 +730,19 @@ namespace
         key.name = it.name.value_or("fk_" + std::to_string(id));
         check_definition_name(key.name);
         key.child_index = child_index;
-        key.child_columns = resolve_columns(child,it.child_columns);
-
-        const table_schema* parent = nullptr;
-        if(it.parent_table == child.name)
-            parent = &child;
-        else
-        {
-            for(const table_schema& table : database.tables)
-            {
-                if(table.name == it.parent_table)
-                {
-                    parent = &table;
-                    break;
-                }
-            }
-        }
-        if(parent == nullptr)
-            throw db_error(error_code::object_not_found,"foreign key parent table does not exist");
-        key.parent_table = parent->id;
-        key.parent_columns = resolve_columns(*parent,it.parent_columns);
-        if(!parent->primary_key || parent->primary_key->columns != key.parent_columns ||
+        std::vector<const column_schema*> child_columns = resolve_columns(child,child_positions,it.child_columns);
+        std::vector<const column_schema*> parent_columns = resolve_columns(parent,parent_positions,it.parent_columns);
+        key.child_columns = column_ids(child_columns);
+        key.parent_table = parent.id;
+        key.parent_columns = column_ids(parent_columns);
+        if(!parent.primary_key || parent.primary_key->columns != key.parent_columns ||
            key.child_columns.size() != key.parent_columns.size())
             throw db_error(error_code::foreign_key_violation,"foreign key must reference the parent primary key");
 
         for(std::size_t i = 0;i < it.child_columns.size();++i)
         {
-            const column_schema& child_column = find_column(child,it.child_columns[i]);
-            const column_schema& parent_column = find_column(*parent,it.parent_columns[i]);
+            const column_schema& child_column = *child_columns[i];
+            const column_schema& parent_column = *parent_columns[i];
             if(child_column.type != parent_column.type || child_column.max_length != parent_column.max_length)
                 throw db_error(error_code::foreign_key_violation,"foreign key column types do not match");
         }
@@ -781,6 +786,9 @@ namespace
         Allocate distinct table, constraint and supporting-index IDs from one local counter.
         Resolve self-references against the new table after its primary key is defined.
         Validate key order, column types, defaults and the effective NOT NULL rule for primary keys.
+        Build temporary name-to-position hash maps for existing tables and the new table's columns.
+        Cache column maps only for referenced parents; reuse resolved columns for type checks.
+        Maps live for this call only and never change vector order or persisted JSON.
 
     result:
         Return the schema and advance database.next_object_id only after all checks succeed.
@@ -796,9 +804,9 @@ namespace
 table_schema from_definition(const create_table_request& request,database_catalog& database)
 {
     check_definition_name(request.name);
-    for(const table_schema& table : database.tables)
-        if(table.name == request.name)
-            throw db_error(error_code::object_exists,"table name already exists");
+    name_positions table_positions = make_name_positions(database.tables,"duplicate table name");
+    if(table_positions.find(request.name) != table_positions.end())
+        throw db_error(error_code::object_exists,"table name already exists");
 
     std::uint64_t next_object_id = database.next_object_id;
     table_schema table;
@@ -806,12 +814,14 @@ table_schema from_definition(const create_table_request& request,database_catalo
     table.name = request.name;
     table.heap_path = path("tables") / (std::to_string(table.id) + ".heap");
     table.columns = from_definition(request.columns);
+    name_positions child_positions = make_name_positions(table.columns,"duplicate column name");
+    std::unordered_map<std::size_t,name_positions> parent_column_positions;
     std::set<std::string> constraint_names;
     if(request.primary_key)
     {
         constraint_id id = allocate_object_id(next_object_id);
         index_id index = allocate_object_id(next_object_id);
-        table.primary_key = from_definition(*request.primary_key,table,id,index);
+        table.primary_key = from_definition(*request.primary_key,table,child_positions,id,index);
         constraint_names.insert(table.primary_key->name);
         table.indexes.push_back(make_constraint_index(index,table.primary_key->columns,index_origin::primary_key));
     }
@@ -820,7 +830,23 @@ table_schema from_definition(const create_table_request& request,database_catalo
     {
         constraint_id id = allocate_object_id(next_object_id);
         index_id index = allocate_object_id(next_object_id);
-        foreign_key_schema key = from_definition(definition,table,database,id,index);
+        const table_schema* parent = &table;
+        const name_positions* parent_positions = &child_positions;
+        if(definition.parent_table != table.name)
+        {
+            name_positions::const_iterator found = table_positions.find(definition.parent_table);
+            if(found == table_positions.end())
+                throw db_error(error_code::object_not_found,"foreign key parent table does not exist");
+            parent = &database.tables[found->second];
+            std::unordered_map<std::size_t,name_positions>::iterator cached =
+                parent_column_positions.find(found->second);
+            if(cached == parent_column_positions.end())
+                cached = parent_column_positions.emplace(
+                    found->second,make_name_positions(parent->columns,"duplicate parent column name")
+                ).first;
+            parent_positions = &cached->second;
+        }
+        foreign_key_schema key = from_definition(definition,table,child_positions,*parent,*parent_positions,id,index);
         if(!constraint_names.insert(key.name).second)
             throw db_error(error_code::object_exists,"duplicate constraint name");
         table.indexes.push_back(make_constraint_index(index,key.child_columns,index_origin::foreign_key));
