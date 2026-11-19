@@ -1,17 +1,18 @@
 #pragma once
 
-#include <db/common/types.h>
 #include <cstddef>
-#include <istream>
+#include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <variant>
+#include <type_traits>
 #include <vector>
 
 namespace db
 {
+
+// ---------- Source records: owned spelling and one-based positions ----------
 
 struct source_position
 {
@@ -25,220 +26,422 @@ struct sql_name
     source_position position;
 };
 
-enum class command_type
-{
-    create_database,
-    drop_database,
-    use_database,
-    show_databases,
-    show_tables,
-    show_indexes,
-    drop_table,
-    describe_table,
-    noop
-};
-
-struct command_statement
-{
-    command_type type;
-    // Named commands require a name; SHOW and noop have none.
-    std::optional<sql_name> name;
-};
-
-enum class literal_type
-{
-    integer,
-    floating,
-    string,
-    null
-};
-
-struct literal
-{
-    literal_type type;
-    // Original token text, including string quotes; binder converts it to db::value.
-    std::string text;
-    source_position position;
-};
-
 struct column_reference
 {
     std::optional<sql_name> table;
     sql_name column;
 };
 
+class ast_visitor;
 struct select_statement;
 
-typedef std::variant<
-    std::monostate,
-    literal,
-    column_reference,
-    std::vector<literal>,
-    std::unique_ptr<select_statement>
-> predicate_operand;
+template<class Node>
+using node_ptr = std::unique_ptr<Node>;
 
-enum class predicate_type
+template<class Node>
+using node_list = std::vector<node_ptr<Node>>;
+
+// ---------- AST ownership and visitor dispatch ----------
+
+// Move-only syntax records: conversion fills public fields before publishing a tree.
+// Required pointers and list entries must be non-null in a successful parse result.
+// Concrete optional children use optional<T>; polymorphic ones use node_ptr<T>.
+class ast_node
 {
-    equal,
-    not_equal,
-    less,
-    less_equal,
-    greater,
-    greater_equal,
-    is_null,
-    is_not_null,
-    in,
-    like
+protected:
+    ast_node() = default;
+    ast_node(ast_node&&) noexcept = default;
+    ast_node& operator=(ast_node&&) noexcept = default;
+
+public:
+    source_position position;
+
+    virtual ~ast_node() = default;
+    virtual void accept(ast_visitor& visitor) const = 0;
+
+    ast_node(const ast_node&) = delete;
+    ast_node& operator=(const ast_node&) = delete;
 };
 
-struct predicate
+namespace detail
 {
+
+// CRTP supplies the same double dispatch for every final syntax node.
+// Only Derived may construct/move this base, so the downcast cannot be
+// introduced accidentally by an unrelated derived class.
+template<class Derived, class Base>
+class ast_leaf : public Base
+{
+    static_assert(std::is_base_of_v<ast_node, Base>);
+    friend Derived;
+
+    ast_leaf() = default;
+    ast_leaf(ast_leaf&&) noexcept = default;
+    ast_leaf& operator=(ast_leaf&&) noexcept = default;
+
+public:
+    ~ast_leaf() override = default;
+    void accept(ast_visitor& visitor) const final;
+};
+
+} // namespace detail
+
+// Category bases share syntax fields; only final leaves dispatch to visitors.
+class statement : public ast_node
+{
+};
+
+class expression : public ast_node
+{
+};
+
+class predicate : public ast_node
+{
+public:
     column_reference left;
-    predicate_type type;
-    // NULL tests use monostate; IN accepts a value list or subquery.
-    predicate_operand right;
 };
 
-enum class aggregate_type
+class field_declaration : public ast_node
 {
-    none,
-    count,
-    average,
-    maximum,
-    minimum,
-    sum
 };
 
-struct selector
+class named_statement : public statement
 {
-    aggregate_type aggregate = aggregate_type::none;
-    // A missing column is valid only for COUNT(*).
-    std::optional<column_reference> column;
+public:
+    sql_name name;
 };
 
-struct order_clause
+class table_statement : public statement
+{
+public:
+    sql_name table;
+};
+
+// ---------- Commands ----------
+
+struct create_database_statement final
+    : detail::ast_leaf<create_database_statement, named_statement> {};
+struct drop_database_statement final
+    : detail::ast_leaf<drop_database_statement, named_statement> {};
+struct use_database_statement final
+    : detail::ast_leaf<use_database_statement, named_statement> {};
+
+// All single-table operations expose their target through table_statement.
+struct drop_table_statement final
+    : detail::ast_leaf<drop_table_statement, table_statement> {};
+struct describe_table_statement final
+    : detail::ast_leaf<describe_table_statement, table_statement> {};
+
+struct show_databases_statement final
+    : detail::ast_leaf<show_databases_statement, statement> {};
+struct show_tables_statement final
+    : detail::ast_leaf<show_tables_statement, statement> {};
+struct show_indexes_statement final
+    : detail::ast_leaf<show_indexes_statement, statement> {};
+struct noop_statement final
+    : detail::ast_leaf<noop_statement, statement> {};
+
+// ---------- Expressions ----------
+
+class literal : public expression
+{
+public:
+    // Preserve the original token, including quotes, until binding.
+    std::string text;
+};
+
+struct integer_literal final : detail::ast_leaf<integer_literal, literal> {};
+struct floating_literal final : detail::ast_leaf<floating_literal, literal> {};
+struct string_literal final : detail::ast_leaf<string_literal, literal> {};
+struct null_literal final : detail::ast_leaf<null_literal, literal> {};
+
+struct column_expression final : detail::ast_leaf<column_expression, expression>
 {
     column_reference column;
-    bool descending = false;
 };
 
-struct limit_clause
+struct wildcard_expression final
+    : detail::ast_leaf<wildcard_expression, expression> {};
+
+struct subquery_expression final : detail::ast_leaf<subquery_expression, expression>
 {
-    literal count;
-    std::optional<literal> offset;
+    node_ptr<select_statement> query;
 };
 
-struct column_declaration
+struct value_list_expression final : detail::ast_leaf<value_list_expression, expression>
+{
+    node_list<literal> values;
+};
+
+class aggregate_expression : public expression
+{
+public:
+    // A column_expression, or wildcard_expression for COUNT(*) only.
+    node_ptr<expression> argument;
+};
+
+struct count_expression final : detail::ast_leaf<count_expression, aggregate_expression> {};
+struct average_expression final : detail::ast_leaf<average_expression, aggregate_expression> {};
+struct maximum_expression final : detail::ast_leaf<maximum_expression, aggregate_expression> {};
+struct minimum_expression final : detail::ast_leaf<minimum_expression, aggregate_expression> {};
+struct sum_expression final : detail::ast_leaf<sum_expression, aggregate_expression> {};
+
+// ---------- WHERE predicates ----------
+
+class comparison_predicate : public predicate
+{
+public:
+    // A literal, column_expression or subquery_expression, validated by conversion.
+    node_ptr<expression> right;
+};
+
+struct equal_predicate final : detail::ast_leaf<equal_predicate, comparison_predicate> {};
+struct not_equal_predicate final : detail::ast_leaf<not_equal_predicate, comparison_predicate> {};
+struct less_predicate final : detail::ast_leaf<less_predicate, comparison_predicate> {};
+struct less_equal_predicate final : detail::ast_leaf<less_equal_predicate, comparison_predicate> {};
+struct greater_predicate final : detail::ast_leaf<greater_predicate, comparison_predicate> {};
+struct greater_equal_predicate final
+    : detail::ast_leaf<greater_equal_predicate, comparison_predicate> {};
+
+class null_predicate : public predicate
+{
+};
+
+struct is_null_predicate final : detail::ast_leaf<is_null_predicate, null_predicate> {};
+struct is_not_null_predicate final : detail::ast_leaf<is_not_null_predicate, null_predicate> {};
+
+struct in_predicate final : detail::ast_leaf<in_predicate, predicate>
+{
+    // A value_list_expression or subquery_expression; never null after parsing.
+    node_ptr<expression> right;
+};
+
+struct like_predicate final : detail::ast_leaf<like_predicate, predicate>
+{
+    string_literal pattern;
+};
+
+// ---------- Query clauses ----------
+
+class order_clause : public ast_node
+{
+public:
+    column_reference column;
+};
+
+struct ascending_order final : detail::ast_leaf<ascending_order, order_clause> {};
+struct descending_order final : detail::ast_leaf<descending_order, order_clause> {};
+
+struct limit_clause final : detail::ast_leaf<limit_clause, ast_node>
+{
+    integer_literal count;
+    std::optional<integer_literal> offset;
+};
+
+// ---------- Table fields and constraints ----------
+
+class type_specification : public ast_node
+{
+};
+
+struct integer_type final : detail::ast_leaf<integer_type, type_specification> {};
+struct floating_type final : detail::ast_leaf<floating_type, type_specification> {};
+
+struct varchar_type final : detail::ast_leaf<varchar_type, type_specification>
+{
+    integer_literal max_length;
+};
+
+class column_attribute : public ast_node
+{
+};
+
+struct not_null_attribute final : detail::ast_leaf<not_null_attribute, column_attribute> {};
+
+struct default_attribute final : detail::ast_leaf<default_attribute, column_attribute>
+{
+    // DEFAULT NULL owns a null_literal; absence of this attribute means no DEFAULT.
+    node_ptr<literal> value;
+};
+
+struct column_declaration final : detail::ast_leaf<column_declaration, field_declaration>
 {
     sql_name name;
-    data_type type;
-    // Only VARCHAR has a length token; range validation belongs to binder.
-    std::optional<literal> max_length;
-    bool nullable = true;
-    // Missing DEFAULT differs from DEFAULT NULL.
-    std::optional<literal> default_value;
+    node_ptr<type_specification> type;
+    // SQL.g4 permits each attribute once, with NOT NULL before DEFAULT.
+    std::optional<not_null_attribute> not_null;
+    std::optional<default_attribute> default_value;
 };
 
-enum class key_type
+class key_declaration : public field_declaration
 {
-    index,
-    primary_key,
-    foreign_key,
-    unique
-};
-
-struct foreign_reference
-{
-    sql_name table;
-    std::vector<sql_name> columns;
-};
-
-struct key_declaration
-{
-    key_type type;
+public:
     std::optional<sql_name> name;
     std::vector<sql_name> columns;
-    // Only a foreign-key definition has a REFERENCES clause.
-    std::optional<foreign_reference> reference;
 };
 
-typedef std::variant<column_declaration,key_declaration> field_declaration;
+struct index_declaration final : detail::ast_leaf<index_declaration, key_declaration> {};
+struct primary_key_declaration final
+    : detail::ast_leaf<primary_key_declaration, key_declaration> {};
 
-struct create_table_statement
+struct foreign_key_declaration final : detail::ast_leaf<foreign_key_declaration, key_declaration>
 {
-    sql_name name;
-    // Preserve the order of columns and table constraints in field_list.
-    std::vector<field_declaration> fields;
+    sql_name parent_table;
+    std::vector<sql_name> parent_columns;
 };
 
-struct insert_statement
+struct unique_declaration final : detail::ast_leaf<unique_declaration, key_declaration> {};
+
+// ---------- Structured statements ----------
+
+struct create_table_statement final : detail::ast_leaf<create_table_statement, table_statement>
 {
-    sql_name table;
-    std::vector<std::vector<literal>> rows;
+    // Preserve the original order of columns and table constraints.
+    node_list<field_declaration> fields;
 };
 
-struct select_statement
+struct insert_statement final : detail::ast_leaf<insert_statement, table_statement>
+{
+    std::vector<node_list<literal>> rows;
+};
+
+struct select_statement final : detail::ast_leaf<select_statement, statement>
 {
     std::vector<sql_name> tables;
-    bool select_all = false;
-    std::vector<selector> selectors;
-    // Conditions combine using AND; an empty list means no WHERE clause.
-    std::vector<predicate> conditions;
+    // SELECT * has exactly one wildcard_expression; otherwise use columns/aggregates.
+    node_list<expression> selectors;
+    // WHERE combines predicates with AND; an empty list means no WHERE clause.
+    node_list<predicate> conditions;
     std::optional<column_reference> group_by;
-    std::optional<order_clause> order_by;
+    node_ptr<order_clause> order_by;
     std::optional<limit_clause> limit;
 };
 
 struct assignment
 {
     sql_name column;
-    literal replacement;
+    node_ptr<literal> replacement;
 };
 
-struct update_statement
+struct update_statement final : detail::ast_leaf<update_statement, table_statement>
 {
-    sql_name table;
     std::vector<assignment> assignments;
-    std::vector<predicate> conditions;
+    // UPDATE requires WHERE; unlike SELECT/DELETE this list cannot be empty.
+    node_list<predicate> conditions;
 };
 
-struct delete_statement
+struct delete_statement final : detail::ast_leaf<delete_statement, table_statement>
 {
-    sql_name table;
-    std::vector<predicate> conditions;
+    node_list<predicate> conditions;
 };
 
-struct load_statement
+struct load_statement final : detail::ast_leaf<load_statement, table_statement>
 {
-    sql_name table;
-    literal path;
-    literal delimiter;
+    string_literal path;
+    string_literal delimiter;
 };
 
-enum class alter_action
+struct add_key_statement final : detail::ast_leaf<add_key_statement, table_statement>
 {
-    add,
-    drop
+    node_ptr<key_declaration> key;
 };
 
-struct alter_table_statement
+class drop_key_statement : public table_statement
 {
-    sql_name table;
-    alter_action action;
-    // ADD supplies a definition; DROP supplies only the key kind and optional name.
-    key_declaration key;
 };
 
-typedef std::variant<
-    command_statement,
-    create_table_statement,
-    insert_statement,
-    select_statement,
-    update_statement,
-    delete_statement,
-    load_statement,
-    alter_table_statement
-> statement;
+struct drop_index_statement final : detail::ast_leaf<drop_index_statement, drop_key_statement>
+{
+    sql_name name;
+};
+
+struct drop_primary_key_statement final
+    : detail::ast_leaf<drop_primary_key_statement, drop_key_statement>
+{
+    // Only PRIMARY KEY permits omission of the key name.
+    std::optional<sql_name> name;
+};
+
+struct drop_foreign_key_statement final
+    : detail::ast_leaf<drop_foreign_key_statement, drop_key_statement>
+{
+    sql_name name;
+};
+
+// ---------- Exhaustive visitor interface ----------
+
+// No default handler: adding a leaf requires each visitor to handle it explicitly.
+// accept dispatches one node; traversal and result storage belong to the visitor.
+class ast_visitor
+{
+public:
+    virtual ~ast_visitor() = default;
+
+    virtual void visit(const create_database_statement& node) = 0;
+    virtual void visit(const drop_database_statement& node) = 0;
+    virtual void visit(const use_database_statement& node) = 0;
+    virtual void visit(const drop_table_statement& node) = 0;
+    virtual void visit(const describe_table_statement& node) = 0;
+    virtual void visit(const show_databases_statement& node) = 0;
+    virtual void visit(const show_tables_statement& node) = 0;
+    virtual void visit(const show_indexes_statement& node) = 0;
+    virtual void visit(const noop_statement& node) = 0;
+    virtual void visit(const integer_literal& node) = 0;
+    virtual void visit(const floating_literal& node) = 0;
+    virtual void visit(const string_literal& node) = 0;
+    virtual void visit(const null_literal& node) = 0;
+    virtual void visit(const column_expression& node) = 0;
+    virtual void visit(const wildcard_expression& node) = 0;
+    virtual void visit(const subquery_expression& node) = 0;
+    virtual void visit(const value_list_expression& node) = 0;
+    virtual void visit(const count_expression& node) = 0;
+    virtual void visit(const average_expression& node) = 0;
+    virtual void visit(const maximum_expression& node) = 0;
+    virtual void visit(const minimum_expression& node) = 0;
+    virtual void visit(const sum_expression& node) = 0;
+    virtual void visit(const equal_predicate& node) = 0;
+    virtual void visit(const not_equal_predicate& node) = 0;
+    virtual void visit(const less_predicate& node) = 0;
+    virtual void visit(const less_equal_predicate& node) = 0;
+    virtual void visit(const greater_predicate& node) = 0;
+    virtual void visit(const greater_equal_predicate& node) = 0;
+    virtual void visit(const is_null_predicate& node) = 0;
+    virtual void visit(const is_not_null_predicate& node) = 0;
+    virtual void visit(const in_predicate& node) = 0;
+    virtual void visit(const like_predicate& node) = 0;
+    virtual void visit(const ascending_order& node) = 0;
+    virtual void visit(const descending_order& node) = 0;
+    virtual void visit(const limit_clause& node) = 0;
+    virtual void visit(const integer_type& node) = 0;
+    virtual void visit(const floating_type& node) = 0;
+    virtual void visit(const varchar_type& node) = 0;
+    virtual void visit(const not_null_attribute& node) = 0;
+    virtual void visit(const default_attribute& node) = 0;
+    virtual void visit(const column_declaration& node) = 0;
+    virtual void visit(const index_declaration& node) = 0;
+    virtual void visit(const primary_key_declaration& node) = 0;
+    virtual void visit(const foreign_key_declaration& node) = 0;
+    virtual void visit(const unique_declaration& node) = 0;
+    virtual void visit(const create_table_statement& node) = 0;
+    virtual void visit(const insert_statement& node) = 0;
+    virtual void visit(const select_statement& node) = 0;
+    virtual void visit(const update_statement& node) = 0;
+    virtual void visit(const delete_statement& node) = 0;
+    virtual void visit(const load_statement& node) = 0;
+    virtual void visit(const add_key_statement& node) = 0;
+    virtual void visit(const drop_index_statement& node) = 0;
+    virtual void visit(const drop_primary_key_statement& node) = 0;
+    virtual void visit(const drop_foreign_key_statement& node) = 0;
+};
+
+template<class Derived, class Base>
+void detail::ast_leaf<Derived, Base>::accept(ast_visitor& visitor) const
+{
+    static_assert(std::is_final_v<Derived>);
+    visitor.visit(static_cast<const Derived&>(*this));
+}
+
+// ---------- Input boundary (parse_one implementation is still pending) ----------
 
 class statement_reader
 {
@@ -246,7 +449,7 @@ private:
     enum class lexical_state
     {
         normal,
-        string,
+        quoted_string,
         comment
     };
 
@@ -258,27 +461,35 @@ private:
     };
 
     std::istream& input_;
-    std::string line_;
     std::size_t offset_ = 0;
+    std::string line_;
     std::string pending_;
     lexical_state lexical_state_ = lexical_state::normal;
+    bool comment_has_content_ = false;
     reader_state state_ = reader_state::active;
 
-public:
-    explicit statement_reader(std::istream& input);
-
-    std::optional<std::string> next();
+    // true: continue collecting; false: a statement is ready or input has ended.
+    bool read_next_token();
 
     statement_reader(const statement_reader&) = delete;
     statement_reader& operator=(const statement_reader&) = delete;
     statement_reader(statement_reader&&) = delete;
     statement_reader& operator=(statement_reader&&) = delete;
+public:
+    // Borrow input for this reader's lifetime; construction performs no reads.
+    explicit statement_reader(std::istream& input) noexcept;
+
+    // Owned, semicolon-terminated SQL; nullopt means normal EOF or standalone exit.
+    // Unfinished input raises syntax_error; a stream failure raises io_error.
+    [[nodiscard]] std::optional<std::string> next();
 };
 
 class parser
 {
 public:
-    statement parse_one(std::string_view sql) const;
+    // Exactly one complete SQL statement; borrow sql only until return.
+    // Success owns all text/subtrees; syntax_error includes one-based line/column.
+    [[nodiscard]] node_ptr<statement> parse_one(std::string_view sql) const;
 };
 
-}
+} // namespace db
