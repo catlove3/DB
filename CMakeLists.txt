@@ -51,9 +51,11 @@ target_include_directories(db_catalog PUBLIC "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(db_catalog PUBLIC db_record PRIVATE nlohmann_json::nlohmann_json)
 idbs_configure_target(db_catalog)
 
+include(cmake/Antlr.cmake)
+
 add_library(db_parser STATIC src/parser/parser.cpp)
 target_include_directories(db_parser PUBLIC "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(db_parser PUBLIC db_common)
+target_link_libraries(db_parser PUBLIC db_common PRIVATE db_sql_grammar)
 idbs_configure_target(db_parser)
 
 add_executable(mydb src/main.cpp)
@@ -61,9 +63,15 @@ target_link_libraries(mydb PRIVATE db_common db_storage)
 idbs_configure_target(mydb)
 
 # Add index/execution libraries when they have real sources.
-# db_parser currently implements the reader and AST; ANTLR is not linked yet.
+# db_parser has the generated grammar available privately; AST conversion is pending.
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(unit_sql_grammar tests/unit/test_sql_grammar.cpp)
+    target_link_libraries(unit_sql_grammar PRIVATE db_sql_grammar)
+    idbs_configure_target(unit_sql_grammar)
+    add_test(NAME unit_sql_grammar COMMAND unit_sql_grammar)
+    set_tests_properties(unit_sql_grammar PROPERTIES TIMEOUT 30)
+
     add_executable(unit_statement_reader tests/unit/test_statement_reader.cpp)
     target_link_libraries(unit_statement_reader PRIVATE db_parser)
     idbs_configure_target(unit_statement_reader)

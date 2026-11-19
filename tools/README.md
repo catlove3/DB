@@ -1,15 +1,56 @@
 # 开发工具
 
-当前基础构建只编译 CLI，不需要 Java 或 ANTLR。实现解析器时，先准备版本兼容的 ANTLR 工具和 C++ runtime，并把实际版本记录到 `third_party/README.md`。
+ANTLR 生成工具固定为 **4.13.2**，文件是 `antlr-4.13.2-complete.jar`，与仓库中的 C++ runtime 版本一致。
+工具许可证见 [antlr-LICENSE.txt](antlr-LICENSE.txt)，来源与 SHA-256 见 [依赖记录](../third_party/README.md)。
+jar 内包含的 ANTLR 3 runtime、StringTemplate 和 TreeLayout 许可证见
+[第三方声明](antlr-THIRD-PARTY-NOTICES.txt)。
 
-把选定的工具 jar 放在 `tools/antlr4.jar` 后，可从仓库根目录运行以下命令。进入文法目录生成，避免输入路径使输出额外嵌套 `grammar/`：
+## Java 环境
+
+生成器需要 Java 11+；运行编译好的 C++ 程序不需要 Java。Ubuntu/WSL 可以安装：
+
+```bash
+sudo apt-get install openjdk-17-jre-headless
+java -version
+```
+
+CMake 优先查找系统 Java。也可以显式指定：
+
+```bash
+cmake --preset debug -DJava_JAVA_EXECUTABLE=/path/to/jre/bin/java
+```
+
+没有系统 Java 时，CMake 也会检查项目本地 `tools/.java/bin/java`。这个目录用于本机准备的
+便携 JRE，已被 Git 忽略，不随仓库分发；CMake 不会自动下载安装 Java。
+
+## 自动生成与编译
+
+从仓库根目录执行：
+
+```bash
+cmake --preset debug
+cmake --build --preset debug --parallel 2
+ctest --preset debug
+```
+
+生成由 `cmake/Antlr.cmake` 管理，文法或 jar 更新后自动重新生成。仅生成代码可执行：
+
+```bash
+cmake --build build-debug --target generate_sql_parser
+```
+
+实际生成命令等价于：
 
 ```bash
 cd grammar
-java -jar ../tools/antlr4.jar -Dlanguage=Cpp -visitor -no-listener -o ../generated SQL.g4
+java -jar ../tools/antlr-4.13.2-complete.jar \
+  -Dlanguage=Cpp -visitor -no-listener -Werror \
+  -o ../build-debug/generated/sql SQL.g4
 cd ..
 ```
 
-jar 不随骨架提供。生成后，检查 `generated/` 的实际文件，再添加 runtime 依赖、解析器 CMake 目标和错误处理。生成代码不会自动加入现有 `mydb`。
+生成文件不提交，也不要手工修改。`db_sql_grammar` 编译生成代码并链接静态 runtime；
+`db_parser` 私有依赖它，公共 `parser.h` 不包含 ANTLR 头文件。
+`unit_sql_grammar` 验证版本、合法/非法 SQL、错误位置和生成的 Visitor 分派。
 
 之后可在这里增加 `dump-page`、`dump-tree` 等调试工具，工具的进度输出写 stderr，避免污染 DBMS 批处理 stdout。

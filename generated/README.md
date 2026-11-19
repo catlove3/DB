@@ -1,7 +1,10 @@
 # 解析器生成目录
 
-当前只有原始文法 `grammar/SQL.g4`，尚未生成解析器，也尚未链接 ANTLR runtime。
+ANTLR 生成过程已接入 CMake，使用 `grammar/SQL.g4` 和固定版本 4.13.2 的工具/runtime。
 
-本工程选择“本地或构建时生成，生成产物不提交”的方式。生成步骤见 [tools/README.md](../tools/README.md)。接入构建时应声明生成目标的依赖，并让 `db_parser` 编译实际生成的源码。
+实际输出位于各自构建目录的 `generated/sql/`，例如 `build-debug/generated/sql/`，
+其中包含 `SQLLexer`、`SQLParser`、`SQLBaseVisitor`、`SQLVisitor` 的 `.h/.cpp`，
+以及 `.tokens/.interp`。Debug/Release 构建互不覆盖。
 
-此目录中的生成文件已由根 `.gitignore` 忽略；不要把手写 AST、Visitor 业务代码放在这里，应放到 `include/db/parser/` 和 `src/parser/`。
+源码树的这个目录只保留说明。生成产物不提交；具体步骤见 [tools/README.md](../tools/README.md)。
+手写 AST、Visitor 业务代码仍放在 `include/db/parser/` 和 `src/parser/`。

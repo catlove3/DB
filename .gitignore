@@ -40,10 +40,12 @@ ipch/
 /data/
 /test-data*/
 
-# Generate the parser locally once ANTLR is introduced
+# ANTLR outputs and the optional machine-local Java runtime
 /generated/*
 !/generated/README.md
 /tools/antlr*.jar
+!/tools/antlr-4.13.2-complete.jar
+/tools/.java/
 
 # Local presets and Python caches
 CMakeUserPresets.json

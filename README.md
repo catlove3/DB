@@ -6,7 +6,10 @@
 
 ## 编译与运行
 
-需要 CMake 3.21+ 和支持 C++17 的编译器。CLI 测试另需 Python 3；当前构建不需要 Java 或 ANTLR。
+需要 CMake 3.21+、支持 C++17 的编译器和 Java 11+ 运行环境。CLI 测试另需 Python 3。
+ANTLR 4.13.2 的生成工具和 C++ runtime 源码已随仓库保存，配置与构建不下载依赖。
+CMake 会从官方 `grammar/SQL.g4` 自动生成 Lexer、Parser 和 Visitor，输出到构建目录的
+`generated/sql/`。Java 安装和生成步骤见 [工具说明](tools/README.md)。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
@@ -16,7 +19,9 @@ ctest --test-dir build --output-on-failure --no-tests=error
 ./build/mydb
 ```
 
-CTest 包含 catalog 单元测试和 `catalog_restart` 集成测试。后者启动三个独立进程，验证跨页记录的插入、更新、删除，以及数据库删除和重建在正常退出后能够持久保存；Linux 下还通过故障注入验证写入、关闭、重命名和文件删除失败的处理。
+CTest 包含 `unit_statement_reader`（拆句与输入错误）、`unit_sql_grammar`（ANTLR 文法与 Visitor）、catalog 单元测试和 `catalog_restart` 集成测试。后者启动三个独立进程，验证跨页记录的插入、更新、删除，以及数据库删除和重建在正常退出后能够持久保存；Linux 下还通过故障注入验证写入、关闭、重命名和文件删除失败的处理。
+
+ANTLR 生成代码已接入 `db_parser` 的私有依赖；`parser::parse_one()` 和解析树到 AST 的转换仍待实现，CLI 尚未使用这套解析流程。
 
 交互输入 `exit` 或读到 EOF 会正常退出。批处理检查可运行：
 

@@ -58,8 +58,8 @@ namespace
     Implementation status:
         AST records, ownership aliases and shared Visitor dispatch are defined in parser.h.
         statement_reader implements splitting, standalone comments and shell exit handling.
-        parser::parse_one remains an interface contract; the lexer, parse-tree conversion
-        and ANTLR build integration are not implemented.
+        The ANTLR lexer/parser/visitors are generated and linked through db_sql_grammar.
+        parser::parse_one and the parse-tree-to-AST conversion remain unimplemented.
 */
 
 /*
