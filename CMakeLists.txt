@@ -55,7 +55,8 @@ include(cmake/Antlr.cmake)
 
 add_library(db_parser STATIC src/parser/parser.cpp)
 target_include_directories(db_parser PUBLIC "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(db_parser PUBLIC db_common PRIVATE db_sql_grammar)
+# parser.h exposes generated ANTLR types, so consumers need their include paths.
+target_link_libraries(db_parser PUBLIC db_common db_sql_grammar)
 idbs_configure_target(db_parser)
 
 add_executable(mydb src/main.cpp)
@@ -63,9 +64,15 @@ target_link_libraries(mydb PRIVATE db_common db_storage)
 idbs_configure_target(mydb)
 
 # Add index/execution libraries when they have real sources.
-# db_parser has the generated grammar available privately; AST conversion is pending.
+# db_parser exposes the generated grammar through its public headers.
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(unit_select_ast tests/unit/test_select_ast.cpp)
+    target_link_libraries(unit_select_ast PRIVATE db_parser)
+    idbs_configure_target(unit_select_ast)
+    add_test(NAME unit_select_ast COMMAND unit_select_ast)
+    set_tests_properties(unit_select_ast PROPERTIES TIMEOUT 30)
+
     add_executable(unit_sql_grammar tests/unit/test_sql_grammar.cpp)
     target_link_libraries(unit_sql_grammar PRIVATE db_sql_grammar)
     idbs_configure_target(unit_sql_grammar)

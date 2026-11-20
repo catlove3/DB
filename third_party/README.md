@@ -21,7 +21,8 @@ catalog 使用仓库内的 nlohmann/json；parser 的构建使用仓库内的 AN
 CMake 校验 jar 哈希和 runtime 的 `VERSION`。Java 11+ 是外部构建前提，详见
 [工具说明](../tools/README.md)。上游 demo、测试和动态库关闭，不会下载 GoogleTest；
 runtime 和生成代码使用独立目标，不继承项目手写代码的警告选项。
-生成文件保存在构建树中，`db_parser` 私有依赖 `db_sql_grammar`，不向公共 AST 接口引入 ANTLR 类型。
+生成文件保存在构建树中，`db_parser` 公开依赖 `db_sql_grammar`，让包含 `parser.h` 的目标
+能使用 AST 转换成员声明中的 ANTLR 节点类型。
 
 ## nlohmann/json
 

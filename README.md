@@ -2,7 +2,7 @@
 
 面向第一次实现数据库引擎的学生开发者，根据清华大学 [数据库系统概论实验教程](https://thu-db.github.io/dbs-tutorial/) 整理开发手册，并提供 C++17 工程骨架。
 
-当前已实现页式文件管理、单线程缓存池、page_guard、定长记录页、记录文件的初始化与增删改查、记录扫描和行编码。catalog 模块支持 JSON 元数据保存、数据库创建/选择/删除、普通建表、表的查询/打开/关闭/删除及 table_lease 借用管理，并有对应测试。主键、外键的定义转换已实现；索引创建、约束执行、SQL 解析和执行尚未实现，带主键或外键的建表请求暂时报 `feature_unsupported`。CLI 尚未接入存储和 catalog，输入 SQL 会返回明确的 `!ERROR`。仓库根目录 `IDBS/` 同时是构建、课程评测和示例命令的工作目录。
+当前已实现页式文件管理、单线程缓存池、page_guard、定长记录页、记录文件的初始化与增删改查、记录扫描和行编码。catalog 模块支持 JSON 元数据保存、数据库创建/选择/删除、普通建表、表的查询/打开/关闭/删除及 table_lease 借用管理，并有对应测试。主键、外键的定义转换已实现；索引创建、约束执行和 SQL 执行尚未实现，带主键或外键的建表请求暂时报 `feature_unsupported`。CLI 尚未接入存储和 catalog，输入 SQL 会返回明确的 `!ERROR`。仓库根目录 `IDBS/` 同时是构建、课程评测和示例命令的工作目录。
 
 ## 编译与运行
 
@@ -19,9 +19,9 @@ ctest --test-dir build --output-on-failure --no-tests=error
 ./build/mydb
 ```
 
-CTest 包含 `unit_statement_reader`（拆句与输入错误）、`unit_sql_grammar`（ANTLR 文法与 Visitor）、catalog 单元测试和 `catalog_restart` 集成测试。后者启动三个独立进程，验证跨页记录的插入、更新、删除，以及数据库删除和重建在正常退出后能够持久保存；Linux 下还通过故障注入验证写入、关闭、重命名和文件删除失败的处理。
+CTest 包含 `unit_statement_reader`（拆句与输入错误）、`unit_sql_grammar`（ANTLR 文法与 Visitor）、`unit_select_ast`（SELECT AST 与解析错误报告）、catalog 单元测试和 `catalog_restart` 集成测试。后者启动三个独立进程，验证跨页记录的插入、更新、删除，以及数据库删除和重建在正常退出后能够持久保存；Linux 下还通过故障注入验证写入、关闭、重命名和文件删除失败的处理。
 
-ANTLR 生成代码已接入 `db_parser` 的私有依赖；`parser::parse_one()` 和解析树到 AST 的转换仍待实现，CLI 尚未使用这套解析流程。
+ANTLR 生成代码作为 `db_parser` 的公开依赖，供 AST 转换成员使用。`parser::parse_one()` 已支持 SELECT 的完整 AST 转换，包括 WHERE、聚合、分组排序、LIMIT/OFFSET 和嵌套子查询。词法及语法错误通过 `db_error` 返回一基行列位置，不直接打印；其他语句转换目前报 `feature_unsupported`。CLI 尚未使用这套解析流程。
 
 交互输入 `exit` 或读到 EOF 会正常退出。批处理检查可运行：
 

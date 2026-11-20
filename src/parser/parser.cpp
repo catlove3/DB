@@ -2,6 +2,7 @@
 #include <db/common/error.h>
 #include <istream>
 #include <new>
+#include <utility>
 
 namespace db
 {
@@ -24,6 +25,35 @@ namespace
         context.operation = "read_statement";
         throw db_error(code, message, context);
     }
+
+    [[noreturn]] void parse_error(error_code code, const std::string& message,
+                                 std::size_t line, std::size_t column)
+    {
+        error_context context;
+        context.operation = "parse_one";
+        context.line = line;
+        context.column = column;
+        throw db_error(code, message, context);
+    }
+
+    [[noreturn]] void parse_error(error_code code, const std::string& message,
+                                 antlr4::Token* token)
+    {
+        parse_error(code, message, token->getLine(), token->getCharPositionInLine() + 1);
+    }
+
+    // Lexer and parser errors use the same exception path. Throw on the first
+    // diagnostic so an error-recovered parse tree can never become an AST.
+    class parse_error_listener final : public antlr4::BaseErrorListener
+    {
+    public:
+        void syntaxError(antlr4::Recognizer*, antlr4::Token*, std::size_t line,
+                         std::size_t column, const std::string& message,
+                         std::exception_ptr) override
+        {
+            parse_error(error_code::syntax_error, message, line, column + 1);
+        }
+    };
 
     bool read_line(std::istream& input, std::string& line)
     {
@@ -53,13 +83,32 @@ namespace
             line.push_back('\n'); // Restore only a delimiter actually consumed.
         return true;
     }
+
+
+    bool contains_not(SQLParser::Where_nullContext* node)
+    {
+        for(antlr4::tree::ParseTree* child: node->children)
+        {
+            antlr4::tree::TerminalNode* token = dynamic_cast<antlr4::tree::TerminalNode*>(child);
+            if(token && token->getText() == "NOT")
+                return true;
+        }
+        return false;
+    }
+
+
+
+
+
+
 }
 /*
     Implementation status:
         AST records, ownership aliases and shared Visitor dispatch are defined in parser.h.
         statement_reader implements splitting, standalone comments and shell exit handling.
         The ANTLR lexer/parser/visitors are generated and linked through db_sql_grammar.
-        parser::parse_one and the parse-tree-to-AST conversion remain unimplemented.
+        parser::parse_one validates one statement and converts SELECTs, including subqueries.
+        Other statement conversions and CLI integration remain pending.
 */
 
 /*
@@ -68,7 +117,8 @@ namespace
         Use a Composite of syntax nodes with unique ownership. Category bases share fields;
         final leaves identify SQL operations. Keep binding and execution in separate visitors.
         sql_name, column_reference and assignment are data records, not dispatch targets.
-        AST types do not depend on catalog types, db::value or generated ANTLR headers.
+        AST conversion members accept generated ANTLR contexts; AST data owns its text.
+        AST types do not depend on catalog types or db::value.
 
     layout:
         position        : One-based line/column of the node's first token in the supplied SQL.
@@ -98,6 +148,327 @@ namespace
         a present default_attribute owns a literal even when that literal is NULL.
         Allocation failures propagate; owned intermediate nodes release their subtrees.
 */
+void source_position::set(antlr4::Token * token)
+{
+    line = token->getLine();
+    column = token->getCharPositionInLine() + 1;
+}
+
+source_position::source_position(antlr4::Token * token):line(token->getLine()),
+                                                        column(token->getCharPositionInLine() + 1)
+{
+}
+
+
+sql_name::sql_name(antlr4::tree::TerminalNode* node): text(node->getText()),
+                                                      position(node->getSymbol())
+{
+}
+
+
+column_reference::column_reference(SQLParser::ColumnContext* ctx): column(ctx->Identifier().back())
+{
+    std::vector<antlr4::tree::TerminalNode *> names = ctx->Identifier();
+    if(names.size() == 2)
+        table.emplace(names[0]);
+}
+
+node_ptr<literal> literal::from_parse(SQLParser::ValueContext* ctx)
+{
+    node_ptr<literal> ret;
+         if(ctx->Integer()) ret = std::make_unique<integer_literal>();
+    else if(ctx->Float()) ret = std::make_unique<floating_literal>();
+    else if(ctx->String()) ret = std::make_unique<string_literal>();
+    else if(ctx->Null()) ret = std::make_unique<null_literal>();
+    else
+        throw db_error(error_code::internal_error, "unknown literal");
+
+    ret->text = ctx->getText();
+    ret->position.set(ctx->getStart());
+    return ret;
+}
+
+
+node_ptr<expression> expression::from_parse(SQLParser::ExpressionContext* ctx)
+{
+    if (ctx->value())
+        return literal::from_parse(ctx->value());
+
+    if (ctx->column())
+        return std::make_unique<column_expression>(ctx->column());
+
+    throw db_error(error_code::internal_error, "unknown expression");
+}
+
+column_expression::column_expression(SQLParser::ColumnContext* ctx):column(ctx)
+{
+    position.set(ctx->getStart());
+}
+
+node_ptr<expression> expression::from_selector(SQLParser::SelectorContext* ctx)
+{
+    // A selector is a column, an aggregate over a column, or COUNT(*).
+    if(!ctx->aggregator() && !ctx->Count())
+        return std::make_unique<column_expression>(ctx->column());
+
+    const auto type = ctx->getStart()->getType();
+    node_ptr<aggregate_expression> result;
+    switch(type)
+    {
+    case SQLParser::Count:   result = std::make_unique<count_expression>();   break;
+    case SQLParser::Average: result = std::make_unique<average_expression>(); break;
+    case SQLParser::Max:     result = std::make_unique<maximum_expression>(); break;
+    case SQLParser::Min:     result = std::make_unique<minimum_expression>(); break;
+    case SQLParser::Sum:     result = std::make_unique<sum_expression>();     break;
+    default:
+        throw db_error(error_code::internal_error, "unknown aggregate");
+    }
+
+    if(ctx->column())
+        result->argument = std::make_unique<column_expression>(ctx->column());
+    else
+    {
+        // COUNT(*) has four direct children: COUNT, (, *, ).
+        auto* star = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children.at(2));
+        if(!star || star->getText() != "*")
+            throw db_error(error_code::internal_error, "missing COUNT wildcard");
+        auto argument = std::make_unique<wildcard_expression>();
+        argument->position.set(star->getSymbol());
+        result->argument = std::move(argument);
+    }
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<value_list_expression> value_list_expression::from_parse(SQLParser::Value_listContext* ctx)
+{
+    node_ptr<value_list_expression> ret = std::make_unique<value_list_expression>();
+    ret->position.set(ctx->getStart());
+    ret->values.reserve(ctx->value().size());
+    for(SQLParser::ValueContext* item : ctx->value())
+        ret->values.push_back(literal::from_parse(item));
+
+    return ret;
+}
+
+
+node_ptr<subquery_expression> subquery_expression::from_parse(SQLParser::Select_tableContext* ctx)
+{
+    node_ptr<subquery_expression> result = std::make_unique<subquery_expression>();
+    result->position.set(ctx->getStart());
+    result->query = select_statement::from_parse(ctx);
+    return result;
+}
+
+
+node_ptr<select_statement> select_statement::from_parse(SQLParser::Select_tableContext * ctx)
+{
+    node_ptr<select_statement> ret = std::make_unique<select_statement>();
+    ret->position.set(ctx->getStart());
+
+    // FROM: retain table order and each name's source position.
+    const auto tables = ctx->identifiers()->Identifier();
+    ret->tables.reserve(tables.size());
+    for(antlr4::tree::TerminalNode * table_name : tables)
+        ret->tables.emplace_back(table_name);
+
+    // SELECT * has no selector children in SQL.g4.
+    auto* selectors = ctx->selectors();
+    const auto items = selectors->selector();
+    if(items.empty())
+    {
+        auto star = std::make_unique<wildcard_expression>();
+        star->position.set(selectors->getStart());
+        ret->selectors.push_back(std::move(star));
+    }
+    else
+    {
+        ret->selectors.reserve(items.size());
+        for(auto* item : items)
+            ret->selectors.push_back(expression::from_selector(item));
+    }
+
+    // WHERE conditions are combined with AND, in their original order.
+    if(auto* where = ctx->where_and_clause())
+    {
+        const auto conditions = where->where_clause();
+        ret->conditions.reserve(conditions.size());
+        for(auto* condition : conditions)
+            ret->conditions.push_back(predicate::from_parse(condition));
+    }
+
+    // These keywords are unnamed tokens in SQL.g4. Inspect only direct terminal
+    // children: clauses inside a subquery must not affect this SELECT.
+    bool has_group = false;
+    antlr4::Token* order_token = nullptr;
+    antlr4::Token* limit_token = nullptr;
+    for(auto* child : ctx->children)
+    {
+        auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(child);
+        if(!terminal)
+            continue;
+        const auto text = terminal->getText();
+        if(text == "GROUP")
+            has_group = true;
+        else if(text == "ORDER")
+            order_token = terminal->getSymbol();
+        else if(text == "LIMIT")
+            limit_token = terminal->getSymbol();
+    }
+
+    // Direct column children belong to GROUP BY, then ORDER BY. Projection and
+    // WHERE columns are nested under their own rules and are not in this list.
+    std::size_t column_index = 0;
+    if(has_group)
+        ret->group_by.emplace(ctx->column(column_index++));
+
+    if(order_token)
+    {
+        if(ctx->order() && ctx->order()->getText() == "DESC")
+            ret->order_by = std::make_unique<descending_order>();
+        else
+            ret->order_by = std::make_unique<ascending_order>();
+        ret->order_by->column = column_reference(ctx->column(column_index++));
+        ret->order_by->position.set(order_token);
+    }
+
+    if(limit_token)
+    {
+        ret->limit.emplace();
+        auto& limit = *ret->limit;
+        limit.position.set(limit_token);
+        const auto numbers = ctx->Integer();
+        limit.count.text = numbers.at(0)->getText();
+        limit.count.position.set(numbers.at(0)->getSymbol());
+        if(numbers.size() == 2)
+        {
+            limit.offset.emplace();
+            limit.offset->text = numbers[1]->getText();
+            limit.offset->position.set(numbers[1]->getSymbol());
+        }
+    }
+    return ret;
+}
+
+
+
+
+node_ptr<comparison_predicate> comparison_predicate::from_operator(SQLParser::Operator_Context* ctx)
+{
+    const unsigned flag = (ctx->Greater()        != nullptr)      |
+                         ((ctx->GreaterEqual()  != nullptr) << 1) |
+                         ((ctx->Less()          != nullptr) << 2) |
+                         ((ctx->LessEqual()     != nullptr) << 3) |
+                         ((ctx->NotEqual()      != nullptr) << 4) |
+                         ((ctx->EqualOrAssign() != nullptr) << 5);
+
+    switch(flag)
+    {
+    case 0b000001: return std::make_unique<greater_predicate>();
+    case 0b000010: return std::make_unique<greater_equal_predicate>();
+    case 0b000100: return std::make_unique<less_predicate>();
+    case 0b001000: return std::make_unique<less_equal_predicate>();
+    case 0b010000: return std::make_unique<not_equal_predicate>();
+    case 0b100000: return std::make_unique<equal_predicate>();
+    default:
+        throw db_error(error_code::internal_error, "unknown comparison operator");
+    }
+}
+
+node_ptr<predicate> predicate::from_parse(SQLParser::Where_clauseContext* ctx)
+{
+    SQLParser::Operator_Context* opctx = nullptr;
+    node_ptr<predicate> result = nullptr;
+
+    if(auto* node = dynamic_cast<SQLParser::Where_operator_expressionContext*>(ctx))
+    {
+        opctx = node->operator_();
+
+        node_ptr<comparison_predicate> ret = comparison_predicate::from_operator(opctx);
+        ret->left = column_reference(node->column());
+        ret->right = expression::from_parse(node->expression());
+        ret->position.set(ctx->getStart());
+
+        result = std::move(ret);
+    }
+    else if(auto* node = dynamic_cast<SQLParser::Where_operator_selectContext*>(ctx))
+    {
+        opctx = node->operator_();
+
+        node_ptr<comparison_predicate> ret = comparison_predicate::from_operator(opctx);
+        ret->left = column_reference(node->column());
+        ret->right = subquery_expression::from_parse(node->select_table());
+        ret->position.set(node->getStart());
+
+        result = std::move(ret);
+    }
+    else if(auto * node = dynamic_cast<SQLParser::Where_nullContext*>(ctx))
+    {
+        bool has_not = contains_not(node);
+        node_ptr<null_predicate> ret;
+        if(has_not) ret = std::make_unique<is_not_null_predicate>();
+        else        ret = std::make_unique<is_null_predicate>();
+
+        ret->left = column_reference(node->column());
+        ret->position.set(node->getStart());
+
+        result = std::move(ret);
+    }
+    else if(auto * node = dynamic_cast<SQLParser::Where_in_listContext*>(ctx))
+    {
+        node_ptr<in_predicate> ret = std::make_unique<in_predicate>();
+        ret->left = column_reference(node->column());
+        ret->right = value_list_expression::from_parse(node->value_list());
+        ret->position.set(node->getStart());
+
+        result = std::move(ret);
+    }
+    else if(auto * node = dynamic_cast<SQLParser::Where_in_selectContext*>(ctx))
+    {
+        node_ptr<in_predicate> ret = std::make_unique<in_predicate>();
+        ret->left = column_reference(node->column());
+        ret->right = subquery_expression::from_parse(node->select_table());
+        ret->position.set(node->getStart());
+
+        result = std::move(ret);
+    }
+    else if(auto * node = dynamic_cast<SQLParser::Where_like_stringContext*>(ctx))
+    {
+        node_ptr<like_predicate> ret = std::make_unique<like_predicate>();
+        ret->left = column_reference(node->column());
+        ret->pattern.text = node->String()->getText();
+        ret->pattern.position.set(node->String()->getSymbol());
+        ret->position.set(node->getStart());
+
+        result = std::move(ret);
+    }
+    else
+        parse_error(error_code::internal_error, "unknown predicate node type", ctx->getStart());
+
+    if(result == nullptr)
+        parse_error(error_code::internal_error, "predicate conversion returned no node", ctx->getStart());
+
+    return result;
+}
+
+
+node_ptr<statement> statement::from_parse(SQLParser::StatementContext* ctx)
+{
+    if (SQLParser::Table_statementContext* table = ctx->table_statement())
+    {
+        if (SQLParser::Select_table_Context* select = dynamic_cast<SQLParser::Select_table_Context*>(table))
+        {
+            return select_statement::from_parse(select->select_table());
+        }
+    }
+
+    parse_error(error_code::feature_unsupported, "statement conversion is not implemented", ctx->getStart());
+}
+
+
+
+
+
 
 /*
     CLASS : AST LEAF / AST VISITOR
@@ -345,14 +716,13 @@ std::optional<std::string> statement_reader::next()
 
     method : parse_one
         Borrow sql until return; permit surrounding whitespace. Run the SQL.g4 lexer and
-        parser, collect errors from both, and require exactly one statement plus EOF.
+        parser, report the first lexer/parser diagnostic, and require one statement plus EOF.
         Disable ANTLR's diagnostic printing; report errors through db_error/error_context.
         Do not convert a recovered parse tree if either lexer or parser reported an error.
-        Convert every valid grammar branch, including nested SELECTs and all clauses,
-        validating the structural invariants above. Return a non-null node_ptr<statement>.
+        Convert SELECTs, including nested queries and all clauses; other statement kinds
+        currently raise feature_unsupported. Return a non-null node_ptr<statement>.
         Move ownership to the caller before destroying per-call parsing objects.
-        ANTLR's generated visitor builds this AST; ast_visitor consumes the resulting AST.
-        A syntactically valid operation is represented even if execution does not support it.
+        AST conversion members build the tree; ast_visitor consumes the resulting AST.
 
     errors:
         Empty input, missing terminator, multiple statements or lexical/syntax errors
@@ -361,5 +731,34 @@ std::optional<std::string> statement_reader::next()
         No partial AST is published and no catalog, table or session state is modified.
         A successful result remains valid after input, lexer and parser destruction.
 */
+
+[[nodiscard]] node_ptr<statement> parser::parse_one(std::string_view sql) const
+{
+    antlr4::ANTLRInputStream input(sql);
+    parse_error_listener errors;
+
+    SQLLexer lexer(&input);
+    lexer.removeErrorListeners();
+    lexer.addErrorListener(&errors);
+    antlr4::CommonTokenStream tokens(&lexer);
+    tokens.fill();
+
+    SQLParser parser(&tokens);
+    parser.removeErrorListeners();
+    parser.addErrorListener(&errors);
+    SQLParser::ProgramContext* parser_tree = parser.program();
+
+    const auto statements = parser_tree->statement();
+    if(statements.size() != 1)
+    {
+        // Empty input points to EOF; multiple statements point to the second one.
+        auto* token = statements.empty()
+            ? parser_tree->EOF()->getSymbol()
+            : statements[1]->getStart();
+        parse_error(error_code::syntax_error, "expected exactly one statement", token);
+    }
+
+    return statement::from_parse(statements[0]);
+}
 
 } // namespace db

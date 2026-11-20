@@ -50,7 +50,8 @@ cd ..
 ```
 
 生成文件不提交，也不要手工修改。`db_sql_grammar` 编译生成代码并链接静态 runtime；
-`db_parser` 私有依赖它，公共 `parser.h` 不包含 ANTLR 头文件。
+`db_parser` 公开依赖它，因为 `parser.h` 中的 AST 转换成员使用 ANTLR 生成的节点类型。
 `unit_sql_grammar` 验证版本、合法/非法 SQL、错误位置和生成的 Visitor 分派。
+`unit_select_ast` 通过 `parser::parse_one()` 验证 SELECT AST、嵌套查询、字段位置和错误报告。
 
 之后可在这里增加 `dump-page`、`dump-tree` 等调试工具，工具的进度输出写 stderr，避免污染 DBMS 批处理 stdout。

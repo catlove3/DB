@@ -8,6 +8,10 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+#include <antlr4-runtime.h>
+#include <SQLLexer.h>
+#include <SQLParser.h>
+#include <SQLBaseVisitor.h>
 
 namespace db
 {
@@ -18,18 +22,25 @@ struct source_position
 {
     std::size_t line = 1;
     std::size_t column = 1;
+    void set(antlr4::Token * token);
+    source_position(antlr4::Token * token);
+    source_position() = default;
 };
 
 struct sql_name
 {
     std::string text;
     source_position position;
+    sql_name(antlr4::tree::TerminalNode* node);
+    sql_name() = default;
 };
 
 struct column_reference
 {
     std::optional<sql_name> table;
     sql_name column;
+    column_reference(SQLParser::ColumnContext* ctx);
+    column_reference() = default;
 };
 
 class ast_visitor;
@@ -89,16 +100,22 @@ public:
 // Category bases share syntax fields; only final leaves dispatch to visitors.
 class statement : public ast_node
 {
+public:
+    static node_ptr<statement> from_parse(SQLParser::StatementContext* ctx);
 };
 
 class expression : public ast_node
 {
+public:
+    static node_ptr<expression> from_parse(SQLParser::ExpressionContext* ctx);
+    static node_ptr<expression> from_selector(SQLParser::SelectorContext* ctx);
 };
 
 class predicate : public ast_node
 {
 public:
     column_reference left;
+    static node_ptr<predicate> from_parse(SQLParser::Where_clauseContext* ctx);
 };
 
 class field_declaration : public ast_node
@@ -148,6 +165,7 @@ class literal : public expression
 public:
     // Preserve the original token, including quotes, until binding.
     std::string text;
+    static node_ptr<literal> from_parse(SQLParser::ValueContext* ctx);
 };
 
 struct integer_literal final : detail::ast_leaf<integer_literal, literal> {};
@@ -158,6 +176,7 @@ struct null_literal final : detail::ast_leaf<null_literal, literal> {};
 struct column_expression final : detail::ast_leaf<column_expression, expression>
 {
     column_reference column;
+    explicit column_expression(SQLParser::ColumnContext* ctx);
 };
 
 struct wildcard_expression final
@@ -166,11 +185,13 @@ struct wildcard_expression final
 struct subquery_expression final : detail::ast_leaf<subquery_expression, expression>
 {
     node_ptr<select_statement> query;
+    static node_ptr<subquery_expression> from_parse(SQLParser::Select_tableContext* ctx);
 };
 
 struct value_list_expression final : detail::ast_leaf<value_list_expression, expression>
 {
     node_list<literal> values;
+    static node_ptr<value_list_expression> from_parse(SQLParser::Value_listContext* ctx);
 };
 
 class aggregate_expression : public expression
@@ -193,6 +214,9 @@ class comparison_predicate : public predicate
 public:
     // A literal, column_expression or subquery_expression, validated by conversion.
     node_ptr<expression> right;
+
+    // Create the operator's node type; the caller fills operands and position.
+    static node_ptr<comparison_predicate> from_operator(SQLParser::Operator_Context* ctx);
 };
 
 struct equal_predicate final : detail::ast_leaf<equal_predicate, comparison_predicate> {};
@@ -315,6 +339,8 @@ struct select_statement final : detail::ast_leaf<select_statement, statement>
     std::optional<column_reference> group_by;
     node_ptr<order_clause> order_by;
     std::optional<limit_clause> limit;
+
+    static node_ptr<select_statement> from_parse(SQLParser::Select_tableContext * ctx);
 };
 
 struct assignment
@@ -441,7 +467,7 @@ void detail::ast_leaf<Derived, Base>::accept(ast_visitor& visitor) const
     visitor.visit(static_cast<const Derived&>(*this));
 }
 
-// ---------- Input boundary (parse_one implementation is still pending) ----------
+// ---------- Input boundary ----------
 
 class statement_reader
 {
@@ -489,6 +515,7 @@ class parser
 public:
     // Exactly one complete SQL statement; borrow sql only until return.
     // Success owns all text/subtrees; syntax_error includes one-based line/column.
+    // SELECT conversion is supported; other statements raise feature_unsupported.
     [[nodiscard]] node_ptr<statement> parse_one(std::string_view sql) const;
 };
 
