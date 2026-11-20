@@ -25,6 +25,7 @@ struct source_position
     void set(antlr4::Token * token);
     source_position(antlr4::Token * token);
     source_position() = default;
+    static source_position at_keyword(antlr4::ParserRuleContext* ctx, std::string_view keyword);
 };
 
 struct sql_name
@@ -33,6 +34,7 @@ struct sql_name
     source_position position;
     sql_name(antlr4::tree::TerminalNode* node);
     sql_name() = default;
+    static std::vector<sql_name> from_list(SQLParser::IdentifiersContext* ctx);
 };
 
 struct column_reference
@@ -57,6 +59,7 @@ using node_list = std::vector<node_ptr<Node>>;
 // Move-only syntax records: conversion fills public fields before publishing a tree.
 // Required pointers and list entries must be non-null in a successful parse result.
 // Concrete optional children use optional<T>; polymorphic ones use node_ptr<T>.
+// Conversion members require valid ANTLR contexts; parse_one performs syntax validation.
 class ast_node
 {
 protected:
@@ -102,6 +105,9 @@ class statement : public ast_node
 {
 public:
     static node_ptr<statement> from_parse(SQLParser::StatementContext* ctx);
+    static node_ptr<statement> from_parse(SQLParser::Db_statementContext* ctx);
+    static node_ptr<statement> from_parse(SQLParser::Table_statementContext* ctx);
+    static node_ptr<statement> from_parse(SQLParser::Alter_statementContext* ctx);
 };
 
 class expression : public ast_node
@@ -116,10 +122,14 @@ class predicate : public ast_node
 public:
     column_reference left;
     static node_ptr<predicate> from_parse(SQLParser::Where_clauseContext* ctx);
+    // A null context denotes an omitted WHERE and produces an empty list.
+    static node_list<predicate> from_list(SQLParser::Where_and_clauseContext* ctx);
 };
 
 class field_declaration : public ast_node
 {
+public:
+    static node_ptr<field_declaration> from_parse(SQLParser::FieldContext* ctx);
 };
 
 class named_statement : public statement
@@ -137,26 +147,53 @@ public:
 // ---------- Commands ----------
 
 struct create_database_statement final
-    : detail::ast_leaf<create_database_statement, named_statement> {};
+    : detail::ast_leaf<create_database_statement, named_statement>
+{
+    static node_ptr<create_database_statement> from_parse(SQLParser::Create_dbContext* ctx);
+};
 struct drop_database_statement final
-    : detail::ast_leaf<drop_database_statement, named_statement> {};
+    : detail::ast_leaf<drop_database_statement, named_statement>
+{
+    static node_ptr<drop_database_statement> from_parse(SQLParser::Drop_dbContext* ctx);
+};
 struct use_database_statement final
-    : detail::ast_leaf<use_database_statement, named_statement> {};
+    : detail::ast_leaf<use_database_statement, named_statement>
+{
+    static node_ptr<use_database_statement> from_parse(SQLParser::Use_dbContext* ctx);
+};
 
 // All single-table operations expose their target through table_statement.
 struct drop_table_statement final
-    : detail::ast_leaf<drop_table_statement, table_statement> {};
+    : detail::ast_leaf<drop_table_statement, table_statement>
+{
+    static node_ptr<drop_table_statement> from_parse(SQLParser::Drop_tableContext* ctx);
+};
 struct describe_table_statement final
-    : detail::ast_leaf<describe_table_statement, table_statement> {};
+    : detail::ast_leaf<describe_table_statement, table_statement>
+{
+    static node_ptr<describe_table_statement> from_parse(SQLParser::Describe_tableContext* ctx);
+};
 
 struct show_databases_statement final
-    : detail::ast_leaf<show_databases_statement, statement> {};
+    : detail::ast_leaf<show_databases_statement, statement>
+{
+    static node_ptr<show_databases_statement> from_parse(SQLParser::Show_dbsContext* ctx);
+};
 struct show_tables_statement final
-    : detail::ast_leaf<show_tables_statement, statement> {};
+    : detail::ast_leaf<show_tables_statement, statement>
+{
+    static node_ptr<show_tables_statement> from_parse(SQLParser::Show_tablesContext* ctx);
+};
 struct show_indexes_statement final
-    : detail::ast_leaf<show_indexes_statement, statement> {};
+    : detail::ast_leaf<show_indexes_statement, statement>
+{
+    static node_ptr<show_indexes_statement> from_parse(SQLParser::Show_indexesContext* ctx);
+};
 struct noop_statement final
-    : detail::ast_leaf<noop_statement, statement> {};
+    : detail::ast_leaf<noop_statement, statement>
+{
+    static node_ptr<noop_statement> from_parse(SQLParser::StatementContext* ctx);
+};
 
 // ---------- Expressions ----------
 
@@ -266,6 +303,8 @@ struct limit_clause final : detail::ast_leaf<limit_clause, ast_node>
 
 class type_specification : public ast_node
 {
+public:
+    static node_ptr<type_specification> from_parse(SQLParser::Type_Context* ctx);
 };
 
 struct integer_type final : detail::ast_leaf<integer_type, type_specification> {};
@@ -295,26 +334,40 @@ struct column_declaration final : detail::ast_leaf<column_declaration, field_dec
     // SQL.g4 permits each attribute once, with NOT NULL before DEFAULT.
     std::optional<not_null_attribute> not_null;
     std::optional<default_attribute> default_value;
+    static node_ptr<column_declaration> from_parse(SQLParser::Normal_fieldContext* ctx);
 };
 
 class key_declaration : public field_declaration
 {
 public:
+    // Position starts at INDEX/PRIMARY/FOREIGN/UNIQUE, including for ALTER ADD.
     std::optional<sql_name> name;
     std::vector<sql_name> columns;
 };
 
-struct index_declaration final : detail::ast_leaf<index_declaration, key_declaration> {};
+struct index_declaration final : detail::ast_leaf<index_declaration, key_declaration>
+{
+    static node_ptr<index_declaration> from_parse(SQLParser::Alter_add_indexContext* ctx);
+};
 struct primary_key_declaration final
-    : detail::ast_leaf<primary_key_declaration, key_declaration> {};
+    : detail::ast_leaf<primary_key_declaration, key_declaration>
+{
+    static node_ptr<primary_key_declaration> from_parse(SQLParser::Primary_key_fieldContext* ctx);
+    static node_ptr<primary_key_declaration> from_parse(SQLParser::Alter_table_add_pkContext* ctx);
+};
 
 struct foreign_key_declaration final : detail::ast_leaf<foreign_key_declaration, key_declaration>
 {
     sql_name parent_table;
     std::vector<sql_name> parent_columns;
+    static node_ptr<foreign_key_declaration> from_parse(SQLParser::Foreign_key_fieldContext* ctx);
+    static node_ptr<foreign_key_declaration> from_parse(SQLParser::Alter_table_add_foreign_keyContext* ctx);
 };
 
-struct unique_declaration final : detail::ast_leaf<unique_declaration, key_declaration> {};
+struct unique_declaration final : detail::ast_leaf<unique_declaration, key_declaration>
+{
+    static node_ptr<unique_declaration> from_parse(SQLParser::Alter_table_add_uniqueContext* ctx);
+};
 
 // ---------- Structured statements ----------
 
@@ -322,11 +375,13 @@ struct create_table_statement final : detail::ast_leaf<create_table_statement, t
 {
     // Preserve the original order of columns and table constraints.
     node_list<field_declaration> fields;
+    static node_ptr<create_table_statement> from_parse(SQLParser::Create_tableContext* ctx);
 };
 
 struct insert_statement final : detail::ast_leaf<insert_statement, table_statement>
 {
     std::vector<node_list<literal>> rows;
+    static node_ptr<insert_statement> from_parse(SQLParser::Insert_into_tableContext* ctx);
 };
 
 struct select_statement final : detail::ast_leaf<select_statement, statement>
@@ -347,6 +402,7 @@ struct assignment
 {
     sql_name column;
     node_ptr<literal> replacement;
+    static assignment from_parse(antlr4::tree::TerminalNode* column, SQLParser::ValueContext* value);
 };
 
 struct update_statement final : detail::ast_leaf<update_statement, table_statement>
@@ -354,22 +410,26 @@ struct update_statement final : detail::ast_leaf<update_statement, table_stateme
     std::vector<assignment> assignments;
     // UPDATE requires WHERE; unlike SELECT/DELETE this list cannot be empty.
     node_list<predicate> conditions;
+    static node_ptr<update_statement> from_parse(SQLParser::Update_tableContext* ctx);
 };
 
 struct delete_statement final : detail::ast_leaf<delete_statement, table_statement>
 {
     node_list<predicate> conditions;
+    static node_ptr<delete_statement> from_parse(SQLParser::Delete_from_tableContext* ctx);
 };
 
 struct load_statement final : detail::ast_leaf<load_statement, table_statement>
 {
     string_literal path;
     string_literal delimiter;
+    static node_ptr<load_statement> from_parse(SQLParser::Load_tableContext* ctx);
 };
 
 struct add_key_statement final : detail::ast_leaf<add_key_statement, table_statement>
 {
     node_ptr<key_declaration> key;
+    static node_ptr<add_key_statement> from_parse(SQLParser::Alter_statementContext* ctx);
 };
 
 class drop_key_statement : public table_statement
@@ -379,6 +439,7 @@ class drop_key_statement : public table_statement
 struct drop_index_statement final : detail::ast_leaf<drop_index_statement, drop_key_statement>
 {
     sql_name name;
+    static node_ptr<drop_index_statement> from_parse(SQLParser::Alter_drop_indexContext* ctx);
 };
 
 struct drop_primary_key_statement final
@@ -386,12 +447,14 @@ struct drop_primary_key_statement final
 {
     // Only PRIMARY KEY permits omission of the key name.
     std::optional<sql_name> name;
+    static node_ptr<drop_primary_key_statement> from_parse(SQLParser::Alter_table_drop_pkContext* ctx);
 };
 
 struct drop_foreign_key_statement final
     : detail::ast_leaf<drop_foreign_key_statement, drop_key_statement>
 {
     sql_name name;
+    static node_ptr<drop_foreign_key_statement> from_parse(SQLParser::Alter_table_drop_foreign_keyContext* ctx);
 };
 
 // ---------- Exhaustive visitor interface ----------
@@ -515,7 +578,7 @@ class parser
 public:
     // Exactly one complete SQL statement; borrow sql only until return.
     // Success owns all text/subtrees; syntax_error includes one-based line/column.
-    // SELECT conversion is supported; other statements raise feature_unsupported.
+    // All SQL.g4 statements are converted; binding and execution happen separately.
     [[nodiscard]] node_ptr<statement> parse_one(std::string_view sql) const;
 };
 

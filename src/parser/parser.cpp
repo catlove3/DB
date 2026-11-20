@@ -107,8 +107,8 @@ namespace
         AST records, ownership aliases and shared Visitor dispatch are defined in parser.h.
         statement_reader implements splitting, standalone comments and shell exit handling.
         The ANTLR lexer/parser/visitors are generated and linked through db_sql_grammar.
-        parser::parse_one validates one statement and converts SELECTs, including subqueries.
-        Other statement conversions and CLI integration remain pending.
+        parser::parse_one validates one statement and converts every SQL.g4 branch to AST.
+        Binding, execution and CLI integration remain separate work.
 */
 
 /*
@@ -159,10 +159,32 @@ source_position::source_position(antlr4::Token * token):line(token->getLine()),
 {
 }
 
+source_position source_position::at_keyword(antlr4::ParserRuleContext* ctx, std::string_view keyword)
+{
+    // Only direct tokens belong to this clause; nested names and strings do not.
+    for(auto* child : ctx->children)
+    {
+        auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(child);
+        if(terminal && terminal->getText() == keyword)
+            return source_position(terminal->getSymbol());
+    }
+    parse_error(error_code::internal_error, "missing keyword in parse tree", ctx->getStart());
+}
+
 
 sql_name::sql_name(antlr4::tree::TerminalNode* node): text(node->getText()),
                                                       position(node->getSymbol())
 {
+}
+
+std::vector<sql_name> sql_name::from_list(SQLParser::IdentifiersContext* ctx)
+{
+    const auto names = ctx->Identifier();
+    std::vector<sql_name> result;
+    result.reserve(names.size());
+    for(auto* name : names)
+        result.emplace_back(name);
+    return result;
 }
 
 
@@ -267,10 +289,7 @@ node_ptr<select_statement> select_statement::from_parse(SQLParser::Select_tableC
     ret->position.set(ctx->getStart());
 
     // FROM: retain table order and each name's source position.
-    const auto tables = ctx->identifiers()->Identifier();
-    ret->tables.reserve(tables.size());
-    for(antlr4::tree::TerminalNode * table_name : tables)
-        ret->tables.emplace_back(table_name);
+    ret->tables = sql_name::from_list(ctx->identifiers());
 
     // SELECT * has no selector children in SQL.g4.
     auto* selectors = ctx->selectors();
@@ -289,13 +308,7 @@ node_ptr<select_statement> select_statement::from_parse(SQLParser::Select_tableC
     }
 
     // WHERE conditions are combined with AND, in their original order.
-    if(auto* where = ctx->where_and_clause())
-    {
-        const auto conditions = where->where_clause();
-        ret->conditions.reserve(conditions.size());
-        for(auto* condition : conditions)
-            ret->conditions.push_back(predicate::from_parse(condition));
-    }
+    ret->conditions = predicate::from_list(ctx->where_and_clause());
 
     // These keywords are unnamed tokens in SQL.g4. Inspect only direct terminal
     // children: clauses inside a subquery must not affect this SELECT.
@@ -452,17 +465,408 @@ node_ptr<predicate> predicate::from_parse(SQLParser::Where_clauseContext* ctx)
 }
 
 
+node_list<predicate> predicate::from_list(SQLParser::Where_and_clauseContext* ctx)
+{
+    node_list<predicate> result;
+    if(ctx)
+    {
+        const auto conditions = ctx->where_clause();
+        result.reserve(conditions.size());
+        for(auto* condition : conditions)
+            result.push_back(from_parse(condition));
+    }
+    return result;
+}
+
+// ---------- Database and simple table commands ----------
+
+node_ptr<create_database_statement> create_database_statement::from_parse(SQLParser::Create_dbContext* ctx)
+{
+    auto result = std::make_unique<create_database_statement>();
+    result->name = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<drop_database_statement> drop_database_statement::from_parse(SQLParser::Drop_dbContext* ctx)
+{
+    auto result = std::make_unique<drop_database_statement>();
+    result->name = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<use_database_statement> use_database_statement::from_parse(SQLParser::Use_dbContext* ctx)
+{
+    auto result = std::make_unique<use_database_statement>();
+    result->name = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<drop_table_statement> drop_table_statement::from_parse(SQLParser::Drop_tableContext* ctx)
+{
+    auto result = std::make_unique<drop_table_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<describe_table_statement> describe_table_statement::from_parse(SQLParser::Describe_tableContext* ctx)
+{
+    auto result = std::make_unique<describe_table_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<show_databases_statement> show_databases_statement::from_parse(SQLParser::Show_dbsContext* ctx)
+{
+    auto result = std::make_unique<show_databases_statement>();
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<show_tables_statement> show_tables_statement::from_parse(SQLParser::Show_tablesContext* ctx)
+{
+    auto result = std::make_unique<show_tables_statement>();
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<show_indexes_statement> show_indexes_statement::from_parse(SQLParser::Show_indexesContext* ctx)
+{
+    auto result = std::make_unique<show_indexes_statement>();
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<noop_statement> noop_statement::from_parse(SQLParser::StatementContext* ctx)
+{
+    if(!ctx->Null() && !ctx->Annotation())
+        parse_error(error_code::internal_error, "expected NULL or annotation", ctx->getStart());
+    auto result = std::make_unique<noop_statement>();
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+// ---------- Column types, attributes and table constraints ----------
+
+node_ptr<type_specification> type_specification::from_parse(SQLParser::Type_Context* ctx)
+{
+    const auto keyword = ctx->getStart()->getText();
+    node_ptr<type_specification> result;
+    if(keyword == "INT")
+        result = std::make_unique<integer_type>();
+    else if(keyword == "FLOAT")
+        result = std::make_unique<floating_type>();
+    else if(keyword == "VARCHAR")
+    {
+        auto varchar = std::make_unique<varchar_type>();
+        varchar->max_length.text = ctx->Integer()->getText();
+        varchar->max_length.position.set(ctx->Integer()->getSymbol());
+        result = std::move(varchar);
+    }
+    else
+        parse_error(error_code::internal_error, "unknown column type", ctx->getStart());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<column_declaration> column_declaration::from_parse(SQLParser::Normal_fieldContext* ctx)
+{
+    auto result = std::make_unique<column_declaration>();
+    result->name = sql_name(ctx->Identifier());
+    result->type = type_specification::from_parse(ctx->type_());
+    result->position.set(ctx->getStart());
+    // DEFAULT NULL's token is nested inside value(), not this direct Null().
+    if(ctx->Null())
+    {
+        result->not_null.emplace();
+        result->not_null->position = source_position::at_keyword(ctx, "NOT");
+    }
+    if(ctx->value())
+    {
+        result->default_value.emplace();
+        result->default_value->position = source_position::at_keyword(ctx, "DEFAULT");
+        result->default_value->value = literal::from_parse(ctx->value());
+    }
+    return result;
+}
+
+node_ptr<primary_key_declaration> primary_key_declaration::from_parse(SQLParser::Primary_key_fieldContext* ctx)
+{
+    auto result = std::make_unique<primary_key_declaration>();
+    if(ctx->Identifier())
+        result->name.emplace(ctx->Identifier());
+    result->columns = sql_name::from_list(ctx->identifiers());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<foreign_key_declaration> foreign_key_declaration::from_parse(SQLParser::Foreign_key_fieldContext* ctx)
+{
+    auto result = std::make_unique<foreign_key_declaration>();
+    // Only the optional key name and parent table are direct identifiers.
+    const auto names = ctx->Identifier();
+    if(names.size() == 2)
+        result->name.emplace(names.front());
+    result->parent_table = sql_name(names.back());
+    result->columns = sql_name::from_list(ctx->identifiers(0));
+    result->parent_columns = sql_name::from_list(ctx->identifiers(1));
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<field_declaration> field_declaration::from_parse(SQLParser::FieldContext* ctx)
+{
+    if(auto* node = dynamic_cast<SQLParser::Normal_fieldContext*>(ctx))
+        return column_declaration::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Primary_key_fieldContext*>(ctx))
+        return primary_key_declaration::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Foreign_key_fieldContext*>(ctx))
+        return foreign_key_declaration::from_parse(node);
+    parse_error(error_code::internal_error, "unknown table field", ctx->getStart());
+}
+
+node_ptr<create_table_statement> create_table_statement::from_parse(SQLParser::Create_tableContext* ctx)
+{
+    auto result = std::make_unique<create_table_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    const auto fields = ctx->field_list()->field();
+    result->fields.reserve(fields.size());
+    for(auto* field : fields)
+        result->fields.push_back(field_declaration::from_parse(field));
+    return result;
+}
+
+// ---------- INSERT, UPDATE, DELETE and LOAD ----------
+
+node_ptr<insert_statement> insert_statement::from_parse(SQLParser::Insert_into_tableContext* ctx)
+{
+    auto result = std::make_unique<insert_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    const auto rows = ctx->value_lists()->value_list();
+    result->rows.reserve(rows.size());
+    for(auto* row_ctx : rows)
+    {
+        const auto values = row_ctx->value();
+        node_list<literal> row;
+        row.reserve(values.size());
+        for(auto* value : values)
+            row.push_back(literal::from_parse(value));
+        result->rows.push_back(std::move(row));
+    }
+    return result;
+}
+
+assignment assignment::from_parse(antlr4::tree::TerminalNode* column, SQLParser::ValueContext* value)
+{
+    return {sql_name(column), literal::from_parse(value)};
+}
+
+node_ptr<update_statement> update_statement::from_parse(SQLParser::Update_tableContext* ctx)
+{
+    auto result = std::make_unique<update_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    const auto names = ctx->set_clause()->Identifier();
+    const auto values = ctx->set_clause()->value();
+    result->assignments.reserve(names.size());
+    for(std::size_t i = 0; i < names.size(); ++i)
+        result->assignments.push_back(assignment::from_parse(names[i], values.at(i)));
+    result->conditions = predicate::from_list(ctx->where_and_clause());
+    return result;
+}
+
+node_ptr<delete_statement> delete_statement::from_parse(SQLParser::Delete_from_tableContext* ctx)
+{
+    auto result = std::make_unique<delete_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    result->conditions = predicate::from_list(ctx->where_and_clause());
+    return result;
+}
+
+node_ptr<load_statement> load_statement::from_parse(SQLParser::Load_tableContext* ctx)
+{
+    auto result = std::make_unique<load_statement>();
+    result->table = sql_name(ctx->Identifier());
+    result->position.set(ctx->getStart());
+    result->path.text = ctx->String(0)->getText();
+    result->path.position.set(ctx->String(0)->getSymbol());
+    result->delimiter.text = ctx->String(1)->getText();
+    result->delimiter.position.set(ctx->String(1)->getSymbol());
+    return result;
+}
+
+// ---------- ALTER TABLE constraints and indexes ----------
+
+node_ptr<index_declaration> index_declaration::from_parse(SQLParser::Alter_add_indexContext* ctx)
+{
+    auto result = std::make_unique<index_declaration>();
+    if(ctx->Identifier().size() == 2)
+        result->name.emplace(ctx->Identifier(1));
+    result->columns = sql_name::from_list(ctx->identifiers());
+    result->position = source_position::at_keyword(ctx, "INDEX");
+    return result;
+}
+
+node_ptr<primary_key_declaration> primary_key_declaration::from_parse(SQLParser::Alter_table_add_pkContext* ctx)
+{
+    auto result = std::make_unique<primary_key_declaration>();
+    if(ctx->Identifier().size() == 2)
+        result->name.emplace(ctx->Identifier(1));
+    result->columns = sql_name::from_list(ctx->identifiers());
+    result->position = source_position::at_keyword(ctx, "PRIMARY");
+    return result;
+}
+
+node_ptr<foreign_key_declaration> foreign_key_declaration::from_parse(SQLParser::Alter_table_add_foreign_keyContext* ctx)
+{
+    auto result = std::make_unique<foreign_key_declaration>();
+    // Direct names are: altered table, optional constraint name, parent table.
+    const auto names = ctx->Identifier();
+    if(names.size() == 3)
+        result->name.emplace(names[1]);
+    result->parent_table = sql_name(names.back());
+    result->columns = sql_name::from_list(ctx->identifiers(0));
+    result->parent_columns = sql_name::from_list(ctx->identifiers(1));
+    result->position = source_position::at_keyword(ctx, "FOREIGN");
+    return result;
+}
+
+node_ptr<unique_declaration> unique_declaration::from_parse(SQLParser::Alter_table_add_uniqueContext* ctx)
+{
+    auto result = std::make_unique<unique_declaration>();
+    if(ctx->Identifier().size() == 2)
+        result->name.emplace(ctx->Identifier(1));
+    result->columns = sql_name::from_list(ctx->identifiers());
+    result->position = source_position::at_keyword(ctx, "UNIQUE");
+    return result;
+}
+
+node_ptr<add_key_statement> add_key_statement::from_parse(SQLParser::Alter_statementContext* ctx)
+{
+    auto result = std::make_unique<add_key_statement>();
+    if(auto* node = dynamic_cast<SQLParser::Alter_add_indexContext*>(ctx))
+    {
+        result->table = sql_name(node->Identifier(0));
+        result->key = index_declaration::from_parse(node);
+    }
+    else if(auto* node = dynamic_cast<SQLParser::Alter_table_add_pkContext*>(ctx))
+    {
+        result->table = sql_name(node->Identifier(0));
+        result->key = primary_key_declaration::from_parse(node);
+    }
+    else if(auto* node = dynamic_cast<SQLParser::Alter_table_add_foreign_keyContext*>(ctx))
+    {
+        result->table = sql_name(node->Identifier(0));
+        result->key = foreign_key_declaration::from_parse(node);
+    }
+    else if(auto* node = dynamic_cast<SQLParser::Alter_table_add_uniqueContext*>(ctx))
+    {
+        result->table = sql_name(node->Identifier(0));
+        result->key = unique_declaration::from_parse(node);
+    }
+    else
+        parse_error(error_code::internal_error, "unknown ADD constraint", ctx->getStart());
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<drop_index_statement> drop_index_statement::from_parse(SQLParser::Alter_drop_indexContext* ctx)
+{
+    auto result = std::make_unique<drop_index_statement>();
+    result->table = sql_name(ctx->Identifier(0));
+    result->name = sql_name(ctx->Identifier(1));
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<drop_primary_key_statement> drop_primary_key_statement::from_parse(SQLParser::Alter_table_drop_pkContext* ctx)
+{
+    auto result = std::make_unique<drop_primary_key_statement>();
+    result->table = sql_name(ctx->Identifier(0));
+    if(ctx->Identifier().size() == 2)
+        result->name.emplace(ctx->Identifier(1));
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+node_ptr<drop_foreign_key_statement> drop_foreign_key_statement::from_parse(SQLParser::Alter_table_drop_foreign_keyContext* ctx)
+{
+    auto result = std::make_unique<drop_foreign_key_statement>();
+    result->table = sql_name(ctx->Identifier(0));
+    result->name = sql_name(ctx->Identifier(1));
+    result->position.set(ctx->getStart());
+    return result;
+}
+
+// ---------- Statement dispatch (no storage or execution side effects) ----------
+
+node_ptr<statement> statement::from_parse(SQLParser::Db_statementContext* ctx)
+{
+    if(auto* node = dynamic_cast<SQLParser::Create_dbContext*>(ctx))
+        return create_database_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Drop_dbContext*>(ctx))
+        return drop_database_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Use_dbContext*>(ctx))
+        return use_database_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Show_dbsContext*>(ctx))
+        return show_databases_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Show_tablesContext*>(ctx))
+        return show_tables_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Show_indexesContext*>(ctx))
+        return show_indexes_statement::from_parse(node);
+    parse_error(error_code::internal_error, "unknown database statement", ctx->getStart());
+}
+
+node_ptr<statement> statement::from_parse(SQLParser::Table_statementContext* ctx)
+{
+    if(auto* node = dynamic_cast<SQLParser::Select_table_Context*>(ctx))
+        return select_statement::from_parse(node->select_table());
+    if(auto* node = dynamic_cast<SQLParser::Create_tableContext*>(ctx))
+        return create_table_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Drop_tableContext*>(ctx))
+        return drop_table_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Describe_tableContext*>(ctx))
+        return describe_table_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Insert_into_tableContext*>(ctx))
+        return insert_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Update_tableContext*>(ctx))
+        return update_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Delete_from_tableContext*>(ctx))
+        return delete_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Load_tableContext*>(ctx))
+        return load_statement::from_parse(node);
+    parse_error(error_code::internal_error, "unknown table statement", ctx->getStart());
+}
+
+node_ptr<statement> statement::from_parse(SQLParser::Alter_statementContext* ctx)
+{
+    if(auto* node = dynamic_cast<SQLParser::Alter_drop_indexContext*>(ctx))
+        return drop_index_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Alter_table_drop_pkContext*>(ctx))
+        return drop_primary_key_statement::from_parse(node);
+    if(auto* node = dynamic_cast<SQLParser::Alter_table_drop_foreign_keyContext*>(ctx))
+        return drop_foreign_key_statement::from_parse(node);
+    return add_key_statement::from_parse(ctx);
+}
+
 node_ptr<statement> statement::from_parse(SQLParser::StatementContext* ctx)
 {
-    if (SQLParser::Table_statementContext* table = ctx->table_statement())
-    {
-        if (SQLParser::Select_table_Context* select = dynamic_cast<SQLParser::Select_table_Context*>(table))
-        {
-            return select_statement::from_parse(select->select_table());
-        }
-    }
-
-    parse_error(error_code::feature_unsupported, "statement conversion is not implemented", ctx->getStart());
+    if(ctx->db_statement())
+        return from_parse(ctx->db_statement());
+    if(ctx->table_statement())
+        return from_parse(ctx->table_statement());
+    if(ctx->alter_statement())
+        return from_parse(ctx->alter_statement());
+    if(ctx->Null() || ctx->Annotation())
+        return noop_statement::from_parse(ctx);
+    parse_error(error_code::internal_error, "unknown statement", ctx->getStart());
 }
 
 
@@ -719,8 +1123,8 @@ std::optional<std::string> statement_reader::next()
         parser, report the first lexer/parser diagnostic, and require one statement plus EOF.
         Disable ANTLR's diagnostic printing; report errors through db_error/error_context.
         Do not convert a recovered parse tree if either lexer or parser reported an error.
-        Convert SELECTs, including nested queries and all clauses; other statement kinds
-        currently raise feature_unsupported. Return a non-null node_ptr<statement>.
+        Convert every SQL.g4 statement, including nested queries, declarations and ALTER.
+        Return a non-null node_ptr<statement> without resolving names or accessing storage.
         Move ownership to the caller before destroying per-call parsing objects.
         AST conversion members build the tree; ast_visitor consumes the resulting AST.
 

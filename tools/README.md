@@ -53,5 +53,8 @@ cd ..
 `db_parser` 公开依赖它，因为 `parser.h` 中的 AST 转换成员使用 ANTLR 生成的节点类型。
 `unit_sql_grammar` 验证版本、合法/非法 SQL、错误位置和生成的 Visitor 分派。
 `unit_select_ast` 通过 `parser::parse_one()` 验证 SELECT AST、嵌套查询、字段位置和错误报告。
+`unit_statement_ast` 验证数据库命令、建表、INSERT/UPDATE/DELETE/LOAD、所有 ALTER 分支、
+可选名字与默认值，并检查字符串所有权、string_view 边界、中文及跨行字符串的位置、
+精确错误位置，以及 reader 连续拆句和 parser 报错后继续处理的衔接。
 
 之后可在这里增加 `dump-page`、`dump-tree` 等调试工具，工具的进度输出写 stderr，避免污染 DBMS 批处理 stdout。

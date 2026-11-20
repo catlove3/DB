@@ -67,6 +67,12 @@ idbs_configure_target(mydb)
 # db_parser exposes the generated grammar through its public headers.
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(unit_statement_ast tests/unit/test_statement_ast.cpp)
+    target_link_libraries(unit_statement_ast PRIVATE db_parser)
+    idbs_configure_target(unit_statement_ast)
+    add_test(NAME unit_statement_ast COMMAND unit_statement_ast)
+    set_tests_properties(unit_statement_ast PROPERTIES TIMEOUT 30)
+
     add_executable(unit_select_ast tests/unit/test_select_ast.cpp)
     target_link_libraries(unit_select_ast PRIVATE db_parser)
     idbs_configure_target(unit_select_ast)

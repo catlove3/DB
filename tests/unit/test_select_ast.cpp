@@ -73,7 +73,6 @@ void diagnostics()
         {"SELECT * FROM t WHERE name = '汉'; @", error_code::syntax_error, 1, 35},
         {"SELECT * FROM t WHERE id IN (SELECT FROM u);", error_code::syntax_error, 1, 37},
         {"USE ;", error_code::syntax_error, 1, 5},
-        {" \n USE school;", error_code::feature_unsupported, 2, 2},
         {"USE school;\nSELECT * FROM t;", error_code::syntax_error, 2, 1}
     };
 
@@ -103,6 +102,10 @@ void diagnostics()
         auto next = facade.parse_one("SELECT * FROM t;");
         CHECK(as<select_statement>(next).tables.at(0).text == "t");
     }
+    auto use = facade.parse_one(" \n USE school;");
+    const auto& command = as<use_database_statement>(use);
+    CHECK(command.name.text == "school");
+    CHECK(command.position.line == 2 && command.position.column == 2);
     CHECK(capture.out.str().empty());
     CHECK(capture.err.str().empty());
 }

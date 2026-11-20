@@ -19,9 +19,9 @@ ctest --test-dir build --output-on-failure --no-tests=error
 ./build/mydb
 ```
 
-CTest 包含 `unit_statement_reader`（拆句与输入错误）、`unit_sql_grammar`（ANTLR 文法与 Visitor）、`unit_select_ast`（SELECT AST 与解析错误报告）、catalog 单元测试和 `catalog_restart` 集成测试。后者启动三个独立进程，验证跨页记录的插入、更新、删除，以及数据库删除和重建在正常退出后能够持久保存；Linux 下还通过故障注入验证写入、关闭、重命名和文件删除失败的处理。
+CTest 包含 `unit_statement_reader`（拆句与输入错误）、`unit_sql_grammar`（ANTLR 文法与 Visitor）、`unit_select_ast`（SELECT AST 与解析错误报告）、`unit_statement_ast`（其余语句 AST 与 reader 衔接）、catalog 单元测试和 `catalog_restart` 集成测试。后者启动三个独立进程，验证跨页记录的插入、更新、删除，以及数据库删除和重建在正常退出后能够持久保存；Linux 下还通过故障注入验证写入、关闭、重命名和文件删除失败的处理。
 
-ANTLR 生成代码作为 `db_parser` 的公开依赖，供 AST 转换成员使用。`parser::parse_one()` 已支持 SELECT 的完整 AST 转换，包括 WHERE、聚合、分组排序、LIMIT/OFFSET 和嵌套子查询。词法及语法错误通过 `db_error` 返回一基行列位置，不直接打印；其他语句转换目前报 `feature_unsupported`。CLI 尚未使用这套解析流程。
+ANTLR 生成代码作为 `db_parser` 的公开依赖，供 AST 转换成员使用。`parser::parse_one()` 已覆盖当前 `SQL.g4` 的全部语句：数据库命令、建表及约束、INSERT/UPDATE/DELETE/LOAD、所有 ALTER 分支，以及带聚合、分组排序、LIMIT/OFFSET 和嵌套子查询的 SELECT。独立 NULL 和注释转换为无操作节点。词法及语法错误通过 `db_error` 返回一基行列位置，不直接打印。AST 保留名字、数值和字符串原文；名称解析、类型及约束检查、SQL 执行属于后续层，CLI 尚未使用这套解析流程。
 
 交互输入 `exit` 或读到 EOF 会正常退出。批处理检查可运行：
 
